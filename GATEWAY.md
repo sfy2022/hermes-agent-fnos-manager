@@ -1,9 +1,6 @@
 # 网关、内嵌与原生桥接
 
-本文说明本应用如何接入**飞牛统一网关**，以及 Hermes Workbench 如何挂在子路径下。实现参考：
-
-- [deepseek.harness.fnos](https://github.com/yuexps/deepseek.harness.fnos)：桌面入口、`micro_app` 原生桥接、文件管理 SDK；
-- [sfy2022/fnos-hermes-desktop](https://github.com/sfy2022/fnos-hermes-desktop)：内嵌链路与网关适配层规则（CSP / Cookie / Referer / WebSocket）。
+本文说明本应用如何接入**飞牛统一网关**，以及 Hermes Workbench 如何挂在子路径下。
 
 ## 一、拓扑
 

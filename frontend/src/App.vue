@@ -100,7 +100,7 @@ import Snapshots from './views/Snapshots.vue'
 import Logs from './views/Logs.vue'
 import SettingsView from './views/Settings.vue'
 
-const appVersion = '0.29.0'
+const appVersion = '0.29.1'
 
 const TABS = {
   overview: { title: '概览', icon: Dashboard, view: Overview, label: '概览' },

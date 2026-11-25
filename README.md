@@ -4,21 +4,15 @@
 
 飞牛 NAS（fnOS）上的 **Hermes Agent 管理器**。先安装本应用，再在管理端里选择官方版本安装 Hermes，最后从桌面进入 Hermes Desktop 工作台。
 
-实现对齐两个参考项目：
+## 功能概览
 
-- [yuexps/deepseek.harness.fnos](https://github.com/yuexps/deepseek.harness.fnos)：管理端页面结构、桌面入口/网关接入方式、`micro_app` 微应用模式、文件管理 SDK 调用；
-- [sfy2022/fnos-hermes-desktop](https://github.com/sfy2022/fnos-hermes-desktop)：Hermes Webapp 内嵌链路、网关适配层的 CSP / Cookie / Referer 规则。
-
-## 与参考实现的对齐点
-
-| 能力 | Harness 的做法 | 本应用 |
-| --- | --- | --- |
-| 桌面入口 | 桌面图标指向管理端（`desktop_applaunchname`） | 一致：桌面图标为 **Hermes Admin** |
-| 微应用 | manifest `micro_app = true`，桌面 iframe 注入原生桥接 | 一致：`micro_app = true` |
-| 文件管理 | `@trimjs/web-app` 的 `openFileManager(path)`（原生 IPC） | 一致：工作区/数据目录直接打开文件管理 |
-| 第二入口 | `ui/config` 声明 WebUI service | Hermes Agent 作为应用中心第二打开方式 |
-| 网关适配 | 前缀、CSP frame、Cookie、WebSocket | 一致，并兼容网关剥离前缀后的 `/webapp/...` |
-| 管理端页面 | 概览 / 工作区 / 授权 / 插件 / 快照 / 日志 / 设置 | 一致，按 Hermes 语义实现 |
+- 管理端：概览状态与指标、启停/重启/检查更新/在线部署、状态 WebSocket；
+- 工作区：读取 Hermes Projects，路径映射到宿主机，直接打开飞牛文件管理；
+- 授权：Nous Portal 登录/切换/登出、账号池、环境变量、模型 Key；
+- 插件：技能启用/禁用、预览/审计、安装进度与取消；
+- 快照：异步创建/恢复、进度与取消、恢复前安全快照；
+- 日志：WebSocket 实时推送、过滤、下载、清空；
+- 设置：端口、内存、口令、打开方式、镜像源、网络代理、Docker/原生运行时。
 
 ## 安装
 
@@ -165,5 +159,5 @@ npm run build --prefix frontend
 
 ## 维护者与许可
 
-- 作者 / 维护者 / 发布者：[sfy2022](https://github.com/sfy2022)
+- 维护者 / 发布者：[hermes-agent-fnos-manager](https://github.com/sfy2022/hermes-agent-fnos-manager)
 - 许可证：MIT（见 [LICENSE](LICENSE)）
