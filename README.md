@@ -4,6 +4,8 @@
 
 飞牛 NAS（fnOS）上的 **Hermes Agent 管理器**。先安装本应用，再在管理端里选择官方版本安装 Hermes，最后从桌面进入 Hermes Desktop 工作台。
 
+> 本仓库取代已归档的 [fnos-hermes-desktop](https://github.com/sfy2022/fnos-hermes-desktop)（旧版 fpk 打包方案，2026-11-25 起停止维护）。
+
 ## 功能概览
 
 - 管理端：概览状态与指标、启停/重启/检查更新/在线部署、状态 WebSocket；
