@@ -1,5 +1,5 @@
 appname               = hermes-agent
-version               = 0.29.1
+version               = 0.29.2
 display_name          = Hermes Agent
 desc                  = Hermes Agent 管理应用：先装管理器，再在管理器里手动安装 Hermes Agent。<br/>• 桌面入口「Hermes Admin」→ 管理端；工作台通过应用中心第二入口或管理端打开<br/>• 安装向导可选存储位置、运行权限（Root/Package）与运行时（Docker/原生）<br/>• 会话、记忆、技能持久保存，卸载保留、可直接备份
 platform              = x86
@@ -16,4 +16,4 @@ micro_app             = true
 service_port          = 9121
 checkport             = false
 ctl_stop              = true
-changelog             = 0.29.1 文档与发布信息整理：维护者/发布者指向仓库，移除参考项目说明与个人信息，补齐构建与运行时文档
+changelog             = 0.29.2 镜像拉取默认使用飞牛官方 registry-mirror（docker.fnnas.com），失败自动回退加速站

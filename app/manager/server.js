@@ -73,7 +73,7 @@ const PROJECT_NAME = process.env.HERMES_PROJECT || 'hermes-agent'
 const CONTAINER_NAME = process.env.HERMES_CONTAINER || 'hermes-agent'
 const IMAGE_REPO = process.env.HERMES_IMAGE_REPO || 'nousresearch/hermes-agent'
 const IMAGE_TAG_DEFAULT = process.env.HERMES_IMAGE_TAG || 'main-desktop'
-const IMAGE_MIRROR = process.env.HERMES_IMAGE_MIRROR || 'docker.m.daocloud.io'
+const IMAGE_MIRROR = process.env.HERMES_IMAGE_MIRROR || 'docker.fnnas.com'
 const PREFIX = `/app/${APP_NAME.replace(/\./g, '-')}`
 const APP_VERSION = process.env.TRIM_APPVER || '0.1.0'
 const PORT = Number(process.env.MANAGER_PORT || 0)
@@ -305,22 +305,39 @@ async function ensureImageForInstall(tag) {
     return
   }
   const mirror = (await getAppSettings()).imageMirror
-  const mirrored = `${mirror}/${IMAGE_REPO}:${tag}`
-  jobLog(`拉取镜像：${mirrored}`)
-  let code = await spawnStream('docker', ['pull', mirrored], process.env, (line) => {
-    jobLog(line)
-    pullPercent(line)
-  })
-  if (code === 0) {
-    await run('docker', ['tag', mirrored, canonical], { timeout: 30000 })
-    installJob.percent = 100
-    return
+  let code = 1
+  if (mirror === 'docker.fnnas.com') {
+    jobLog('使用飞牛官方镜像源（Docker 守护进程 registry-mirror）')
+    code = await spawnStream('docker', ['pull', canonical], process.env, (line) => {
+      jobLog(line)
+      pullPercent(line)
+    })
+    if (code !== 0) {
+      jobLog('飞牛官方镜像源拉取失败，回退到加速站')
+      const fallback = `docker.m.daocloud.io/${IMAGE_REPO}:${tag}`
+      code = await spawnStream('docker', ['pull', fallback], process.env, (line) => {
+        jobLog(line)
+        pullPercent(line)
+      })
+      if (code === 0) await run('docker', ['tag', fallback, canonical], { timeout: 30000 })
+    }
+  } else {
+    const mirrored = `${mirror}/${IMAGE_REPO}:${tag}`
+    jobLog(`拉取镜像：${mirrored}`)
+    code = await spawnStream('docker', ['pull', mirrored], process.env, (line) => {
+      jobLog(line)
+      pullPercent(line)
+    })
+    if (code === 0) {
+      await run('docker', ['tag', mirrored, canonical], { timeout: 30000 })
+    } else {
+      jobLog('加速站拉取失败，改走官方仓库')
+      code = await spawnStream('docker', ['pull', canonical], process.env, (line) => {
+        jobLog(line)
+        pullPercent(line)
+      })
+    }
   }
-  jobLog('加速站拉取失败，改走官方仓库')
-  code = await spawnStream('docker', ['pull', canonical], process.env, (line) => {
-    jobLog(line)
-    pullPercent(line)
-  })
   if (code !== 0) throw new Error('镜像拉取失败：请检查网络或先在终端执行 tools/prepull.sh')
   installJob.percent = 100
 }
@@ -1562,7 +1579,13 @@ async function ensureImage() {
   const local = await run('docker', ['image', 'inspect', canonical], { timeout: 15000 })
   if (local.code === 0) return { ok: true, pulled: false }
   const mirror = (await getAppSettings()).imageMirror
-  const mirrored = `${mirror}/${IMAGE_REPO}:${await currentTag()}`
+  const tag = await currentTag()
+  if (mirror === 'docker.fnnas.com') {
+    logLine('INFO', '本地无镜像，使用飞牛官方镜像源（registry-mirror）拉取')
+    const pull = await run('docker', ['pull', `${IMAGE_REPO}:${tag}`], { timeout: 1800000 })
+    return { ok: pull.code === 0, pulled: pull.code === 0 }
+  }
+  const mirrored = `${mirror}/${IMAGE_REPO}:${tag}`
   logLine('INFO', `本地无镜像，尝试从 ${mirror} 拉取`)
   const pull = await run('docker', ['pull', mirrored], { timeout: 1800000 })
   if (pull.code === 0) {
@@ -1663,15 +1686,20 @@ async function doUpgrade(body = {}) {
   const requested = cleanValue(body.tag || (body.version ? `${body.version}-desktop` : '') || oldTag)
   const tag = requested
   const mirror = (await getAppSettings()).imageMirror
-  const mirrored = `${mirror}/${IMAGE_REPO}:${tag}`
   const canonical = `${IMAGE_REPO}:${tag}`
 
   logLine('INFO', `更新镜像：${oldTag} → ${tag}`)
-  const pull = await run('docker', ['pull', mirrored], { timeout: 1800000 })
+  let pull
+  if (mirror === 'docker.fnnas.com') {
+    pull = await run('docker', ['pull', canonical], { timeout: 1800000 })
+  } else {
+    const mirrored = `${mirror}/${IMAGE_REPO}:${tag}`
+    pull = await run('docker', ['pull', mirrored], { timeout: 1800000 })
+    if (pull.code === 0) await run('docker', ['tag', mirrored, canonical], { timeout: 30000 })
+  }
   if (pull.code !== 0) {
     throw new Error(`拉取镜像失败：${pull.stderr.slice(-400) || '网络不可用'}`)
   }
-  await run('docker', ['tag', mirrored, canonical], { timeout: 30000 })
 
   const composeEnv = await readEnv(COMPOSE_ENV)
   composeEnv.set('HERMES_DOCKER_IMAGE_TAG', tag)

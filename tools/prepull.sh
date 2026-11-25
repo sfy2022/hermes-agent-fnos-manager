@@ -7,15 +7,19 @@
 #       之后安装走「本地已有 → 零网络」分支，几秒完成。
 #
 # 用法：sudo bash tools/prepull.sh
-# 可用环境变量覆盖：IMAGE_MIRROR（默认 docker.m.daocloud.io）
+# 可用环境变量覆盖：IMAGE_MIRROR（默认 docker.fnnas.com，走飞牛官方 registry-mirror）
 
 set -euo pipefail
 
 IMAGE_REPO="nousresearch/hermes-agent"
 IMAGE_TAG="${IMAGE_TAG:-main-desktop}"
-IMAGE_MIRROR="${IMAGE_MIRROR:-docker.m.daocloud.io}"
+IMAGE_MIRROR="${IMAGE_MIRROR:-docker.fnnas.com}"
 CANONICAL="${IMAGE_REPO}:${IMAGE_TAG}"
-MIRRORED="${IMAGE_MIRROR}/${IMAGE_REPO}:${IMAGE_TAG}"
+if [ "${IMAGE_MIRROR}" = "docker.fnnas.com" ]; then
+    MIRRORED="${IMAGE_REPO}:${IMAGE_TAG}"
+else
+    MIRRORED="${IMAGE_MIRROR}/${IMAGE_REPO}:${IMAGE_TAG}"
+fi
 
 if docker image inspect "${CANONICAL}" >/dev/null 2>&1; then
     echo "镜像已存在：${CANONICAL}，无需拉取。"

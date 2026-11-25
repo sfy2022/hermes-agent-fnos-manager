@@ -545,7 +545,7 @@ esac
 #
 #   镜像约 3.75 GB；已存在时整段逻辑跳过，不产生网络请求。
 IMAGE_PULL_TIMEOUT="${IMAGE_PULL_TIMEOUT:-900}"
-IMAGE_MIRROR="${IMAGE_MIRROR:-docker.m.daocloud.io}"
+IMAGE_MIRROR="${IMAGE_MIRROR:-docker.fnnas.com}"
 CANONICAL_IMAGE="${IMAGE_REPO}:${IMAGE_TAG}"
 
 image_local_exists() {
@@ -561,13 +561,19 @@ if image_local_exists "${CANONICAL_IMAGE}"; then
     log_msg "镜像 ${CANONICAL_IMAGE} 本地已存在，直接使用（无需联网）"
 elif command -v docker >/dev/null 2>&1 && docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
     image_ready=""
-    if pull_image "${IMAGE_MIRROR}/${IMAGE_REPO}:${IMAGE_TAG}"; then
-        if docker tag "${IMAGE_MIRROR}/${IMAGE_REPO}:${IMAGE_TAG}" "${CANONICAL_IMAGE}" 2>/dev/null; then
-            image_ready="镜像加速站 ${IMAGE_MIRROR}"
+    if [ "${IMAGE_MIRROR}" = "docker.fnnas.com" ]; then
+        if pull_image "${CANONICAL_IMAGE}"; then
+            image_ready="飞牛官方镜像源"
         fi
-    fi
-    if [ -z "${image_ready}" ] && pull_image "${CANONICAL_IMAGE}"; then
-        image_ready="官方仓库"
+    else
+        if pull_image "${IMAGE_MIRROR}/${IMAGE_REPO}:${IMAGE_TAG}"; then
+            if docker tag "${IMAGE_MIRROR}/${IMAGE_REPO}:${IMAGE_TAG}" "${CANONICAL_IMAGE}" 2>/dev/null; then
+                image_ready="镜像加速站 ${IMAGE_MIRROR}"
+            fi
+        fi
+        if [ -z "${image_ready}" ] && pull_image "${CANONICAL_IMAGE}"; then
+            image_ready="官方仓库"
+        fi
     fi
     if [ -n "${image_ready}" ]; then
         log_msg "镜像就绪：${CANONICAL_IMAGE}（来源：${image_ready}）"

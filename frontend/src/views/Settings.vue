@@ -286,7 +286,7 @@ const form = reactive({
   apiEnabled: false,
   apiPort: 8642,
   apiKey: '',
-  imageMirror: 'docker.m.daocloud.io',
+  imageMirror: 'docker.fnnas.com',
   networkProxy: '',
   proxyRuntime: false,
   provider: 'openrouter',
@@ -296,8 +296,8 @@ const form = reactive({
 
 const memoryOptions = [1024, 2048, 3072, 4096, 6144, 8192, 12288].map((mb) => ({ label: `${mb} MB`, value: mb }))
 const mirrorOptions = [
-  { label: 'docker.m.daocloud.io（默认）', value: 'docker.m.daocloud.io' },
-  { label: 'docker.fnnas.com（飞牛）', value: 'docker.fnnas.com' },
+  { label: 'docker.fnnas.com（飞牛官方，默认）', value: 'docker.fnnas.com' },
+  { label: 'docker.m.daocloud.io（DaoCloud 加速）', value: 'docker.m.daocloud.io' },
   { label: 'docker.io（官方）', value: 'docker.io' }
 ]
 
@@ -363,7 +363,7 @@ async function load() {
     form.apiKey = ''
     form.accessMode = s.accessMode || 'gateway'
     form.customUrl = s.customUrl || ''
-    form.imageMirror = s.imageMirror || 'docker.m.daocloud.io'
+    form.imageMirror = s.imageMirror || 'docker.fnnas.com'
     form.networkProxy = s.networkProxy || ''
     form.proxyRuntime = Boolean(s.proxyRuntime)
     form.provider = settings.provider || 'openrouter'
