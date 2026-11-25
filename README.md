@@ -1,5 +1,7 @@
 # Hermes Agent for fnOS
 
+[下载最新版](https://github.com/sfy2022/hermes-agent-fnos-manager/releases/latest) · [GitHub 仓库](https://github.com/sfy2022/hermes-agent-fnos-manager)
+
 飞牛 NAS（fnOS）上的 **Hermes Agent 管理器**。先安装本应用，再在管理端里选择官方版本安装 Hermes，最后从桌面进入 Hermes Desktop 工作台。
 
 实现对齐两个参考项目：

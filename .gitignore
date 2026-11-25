@@ -5,6 +5,8 @@ frontend/dist/
 app/manager/public/
 .npm-cache/
 *.fpk
+*.fpk.sha256
+*.sha256
 *.tgz
 *.tar.gz
 
