@@ -84,7 +84,7 @@
 </template>
 
 <script setup>
-import { computed, h, ref, watch, watchEffect } from 'vue'
+import { computed, defineAsyncComponent, h, ref, watch, watchEffect } from 'vue'
 import {
   NBackTop, NButton, NConfigProvider, NDialogProvider, NDivider, NGlobalStyle, NIcon,
   NLayout, NLayoutContent, NLayoutFooter, NLayoutSider, NMenu, NMessageProvider, NTooltip, darkTheme
@@ -92,15 +92,15 @@ import {
 import { Dashboard, Folder, History, Key, Puzzle, FileText, Settings, Moon, Sun } from '@vicons/tabler'
 import iconUrl from './assets/icon.png'
 import { getThemeOverrides } from './theme.js'
-import Overview from './views/Overview.vue'
-import Workspace from './views/Workspace.vue'
-import Auth from './views/Auth.vue'
-import Plugins from './views/Plugins.vue'
-import Snapshots from './views/Snapshots.vue'
-import Logs from './views/Logs.vue'
-import SettingsView from './views/Settings.vue'
+const Overview = defineAsyncComponent(() => import('./views/Overview.vue'))
+const Workspace = defineAsyncComponent(() => import('./views/Workspace.vue'))
+const Auth = defineAsyncComponent(() => import('./views/Auth.vue'))
+const Plugins = defineAsyncComponent(() => import('./views/Plugins.vue'))
+const Snapshots = defineAsyncComponent(() => import('./views/Snapshots.vue'))
+const Logs = defineAsyncComponent(() => import('./views/Logs.vue'))
+const SettingsView = defineAsyncComponent(() => import('./views/Settings.vue'))
 
-const appVersion = '0.29.3'
+const appVersion = '0.29.4'
 
 const TABS = {
   overview: { title: '概览', icon: Dashboard, view: Overview, label: '概览' },

@@ -1,0 +1,51 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix frontend
+
+      - name: Checks (syntax, version, config, frontend build)
+        run: ./scripts/check.sh
+
+      - name: Build fpk
+        run: ./tools/fnpack build -d .
+
+      - name: Verify tag matches manifest version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VER="$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' manifest | head -n 1 | tr -d '\r ')"
+          if [ "$TAG" != "$VER" ]; then
+            echo "tag $TAG != manifest $VER"
+            exit 1
+          fi
+
+      - name: Checksums
+        run: sha256sum hermes-agent.fpk > hermes-agent.fpk.sha256
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            hermes-agent.fpk
+            hermes-agent.fpk.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true

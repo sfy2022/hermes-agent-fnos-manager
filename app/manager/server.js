@@ -519,7 +519,11 @@ async function listDirEntries(dir) {
   }
 }
 
+const sessionsCache = new Map()
+
 function getSessions(limit = 200) {
+  const cached = sessionsCache.get(limit)
+  if (cached && Date.now() - cached.ts < 5000) return cached.rows
   const dbFile = path.join(DATA_DIR, 'state.db')
   if (!fs.existsSync(dbFile)) return []
   try {
@@ -534,7 +538,9 @@ function getSessions(limit = 200) {
       LIMIT ?
     `).all(limit)
     db.close()
-    return rows.map((row) => ({ ...row }))
+    const mapped = rows.map((row) => ({ ...row }))
+    sessionsCache.set(limit, { ts: Date.now(), rows: mapped })
+    return mapped
   } catch (err) {
     logLine('WARN', `读取会话失败：${err.message}`)
     return []
@@ -1237,6 +1243,7 @@ async function migrateDataDir(src, dst, label) {
     image, '-lc', `mkdir -p /dst && cp -a /src/. /dst/ && chown -R ${uid}:${gid} /dst`
   ], { timeout: 600000 })
   if (r.code !== 0) throw new Error(`${label}数据迁移失败：${(r.stderr || '').slice(-300)}`)
+  if (!(await pathHasData(dst))) throw new Error(`${label}数据迁移后校验失败：目标目录没有有效数据`)
   logLine('INFO', `${label}数据已迁移：${src} → ${dst}`)
   return { migrated: true }
 }
@@ -2089,6 +2096,9 @@ async function runSnapshotRestore(id) {
     await compose(['up', '-d'], 600000).catch(() => {})
     return
   }
+  if (!fs.existsSync(path.join(tempDir, 'config.yaml')) && !fs.existsSync(path.join(tempDir, 'state.db'))) {
+    throw new Error('快照内容不完整（缺少 config.yaml / state.db），已中止恢复')
+  }
 
   setSnapJob({ phase: 'swap', percent: 85, message: '替换数据目录…' })
   await fsp.rm(backupDir, { recursive: true, force: true }).catch(() => {})
@@ -2102,6 +2112,7 @@ async function runSnapshotRestore(id) {
   setSnapJob({ phase: 'start', percent: 94, message: '启动服务…' })
   await compose(['up', '-d'], 600000)
   await fsp.rm(backupDir, { recursive: true, force: true }).catch(() => {})
+  sessionsCache.clear()
   setSnapJob({ state: 'done', percent: 100, message: '恢复完成' })
   setLastMessage('快照已恢复')
   logLine('INFO', `已恢复快照 ${id}（安全快照 ${safetyId}）`)
@@ -2931,6 +2942,7 @@ function streamLogs(req, socket, head, url) {
     buffer = parts.pop() || ''
     for (const line of parts) {
       if (!line.trim()) continue
+      if (socket.writableLength > 1000000) return
       try { socket.write(wsFrame(line)) } catch { /* 连接已断开 */ }
     }
   }
