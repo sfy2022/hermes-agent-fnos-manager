@@ -1,0 +1,15 @@
+[
+    {
+        "stepTitle": "升级确认",
+        "items": [
+            {
+                "type": "tips",
+                "helpText": "升级只替换应用包与容器编排，<strong>不会改动</strong>已保存的访问口令、模型 Key 与数据目录。容器会用现有配置重建，期间 Desktop 短暂不可用。"
+            },
+            {
+                "type": "tips",
+                "helpText": "数据位于共享目录 <code>hermes-agent/data</code>；如需备份，请在升级前复制该目录。"
+            }
+        ]
+    }
+]

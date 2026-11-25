@@ -1,0 +1,30 @@
+{
+    ".url": {
+        "hermes-agent.Application": {
+            "title": "Hermes Admin",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "http",
+            "gatewaySocket": "web.sock",
+            "gatewayPrefix": "/app/hermes-agent",
+            "url": "/app/hermes-agent/",
+            "allUsers": false,
+            "control": {
+                "accessPerm": "readonly",
+                "fullUrlPerm": "readonly",
+                "portPerm": "readonly",
+                "pathPerm": "readonly"
+            }
+        },
+        "hermes-agent.ui.Application": {
+            "title": "Hermes Agent",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "http",
+            "gatewaySocket": "web.sock",
+            "gatewayPrefix": "/app/hermes-agent",
+            "url": "/app/hermes-agent/webapp/",
+            "allUsers": false
+        }
+    }
+}

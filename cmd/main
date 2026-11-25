@@ -1,0 +1,138 @@
+#!/bin/bash
+
+### Hermes Agent 生命周期脚本
+### 由本脚本托管两件事：管理端进程（Node）与 Hermes 容器（docker compose）。
+
+APP_NAME="${TRIM_APPNAME:-hermes-agent}"
+APP_DIR="${HERMES_APP_DIR:-/var/apps/${APP_NAME}}"
+VAR_DIR="${TRIM_PKGVAR:-${APP_DIR}/var}"
+DEST_DIR="${TRIM_APPDEST:-${APP_DIR}/target}"
+COMPOSE_FILE="${DEST_DIR}/docker/docker-compose.yaml"
+SERVER_JS="${DEST_DIR}/manager/server.js"
+SOCKET_PATH="${DEST_DIR}/web.sock"
+PID_FILE="${VAR_DIR}/manager.pid"
+OUT_LOG="${VAR_DIR}/manager.out"
+INFO_LOG="${VAR_DIR}/info.log"
+PROJECT_NAME="hermes-agent"
+
+log_msg() {
+    printf '%s - [main] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"${INFO_LOG}" 2>/dev/null || true
+}
+
+node_bin() {
+    if [ -x /var/apps/nodejs_v24/target/bin/node ]; then
+        printf '%s' /var/apps/nodejs_v24/target/bin/node
+    elif command -v node >/dev/null 2>&1; then
+        command -v node
+    else
+        return 1
+    fi
+}
+
+manager_pid() {
+    [ -r "${PID_FILE}" ] || return 1
+    local pid
+    pid="$(cat "${PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "${pid}" ] || return 1
+    kill -0 "${pid}" 2>/dev/null || return 1
+    printf '%s' "${pid}"
+}
+
+runtime_mode() {
+    local f="${VAR_DIR}/runtime.json"
+    [ -r "$f" ] || { echo docker; return 0; }
+    if grep -q '"mode"[[:space:]]*:[[:space:]]*"native"' "$f" 2>/dev/null; then echo native; else echo docker; fi
+}
+
+start_manager() {
+    if manager_pid >/dev/null 2>&1; then
+        return 0
+    fi
+    [ -f "${SERVER_JS}" ] || { log_msg "ERROR: 管理端入口缺失：${SERVER_JS}"; return 1; }
+    local node
+    node="$(node_bin)" || { log_msg "ERROR: 未找到 node 运行时（依赖 nodejs_v24）"; return 1; }
+
+    rm -f "${SOCKET_PATH}"
+    (
+        cd "${DEST_DIR}/manager" || exit 1
+        HERMES_APP_DIR="${APP_DIR}" \
+        HERMES_DATA_DIR="${APP_DIR}/shares/hermes-agent/data" \
+        HERMES_WORKSPACE_DIR="${APP_DIR}/shares/hermes-agent/workspace" \
+        HERMES_COMPOSE_FILE="${COMPOSE_FILE}" \
+        setsid nohup "${node}" "${SERVER_JS}" >>"${OUT_LOG}" 2>&1 < /dev/null &
+        echo $! >"${PID_FILE}"
+    )
+
+    local i
+    for i in $(seq 1 30); do
+        if [ -S "${SOCKET_PATH}" ]; then
+            log_msg "管理端已启动（socket=${SOCKET_PATH}）"
+            return 0
+        fi
+        sleep 0.5
+    done
+    log_msg "ERROR: 管理端启动超时，请查看 ${OUT_LOG}"
+    return 1
+}
+
+stop_manager() {
+    local pid
+    if pid="$(manager_pid)"; then
+        log_msg "停止管理端进程 PID=${pid}"
+        kill -TERM "${pid}" 2>/dev/null || true
+        local i
+        for i in $(seq 1 10); do
+            kill -0 "${pid}" 2>/dev/null || break
+            sleep 0.5
+        done
+        kill -KILL "${pid}" 2>/dev/null || true
+    fi
+    rm -f "${PID_FILE}" "${SOCKET_PATH}" 2>/dev/null || true
+}
+
+compose_up() {
+    [ -f "${COMPOSE_FILE}" ] || { log_msg "ERROR: 编排文件缺失：${COMPOSE_FILE}"; return 1; }
+    timeout 600 docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" up -d --remove-orphans >>"${INFO_LOG}" 2>&1
+}
+
+compose_stop() {
+    [ -f "${COMPOSE_FILE}" ] || return 0
+    timeout 120 docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" stop >>"${INFO_LOG}" 2>&1 || true
+}
+
+case "$1" in
+    start)
+        mkdir -p "${VAR_DIR}" 2>/dev/null || true
+        start_manager || exit 1
+        if [ "$(runtime_mode)" = "native" ]; then
+            log_msg "原生运行时模式：由管理端托管 Hermes 进程（不启动容器）"
+        elif [ -s "${VAR_DIR}/config.env" ]; then
+            if compose_up; then
+                log_msg "容器已启动"
+            else
+                log_msg "警告：容器启动失败（可在管理端「运行日志」查看原因）"
+            fi
+        else
+            log_msg "Hermes 尚未安装，跳过容器启动（请打开管理端完成安装）"
+        fi
+        exit 0
+        ;;
+    stop)
+        stop_manager
+        if [ -s "${VAR_DIR}/config.env" ]; then
+            compose_stop
+        fi
+        log_msg "应用已停止"
+        exit 0
+        ;;
+    status)
+        if manager_pid >/dev/null 2>&1 && [ -S "${SOCKET_PATH}" ]; then
+            exit 0
+        fi
+        exit 3
+        ;;
+    *)
+        printf '%s\n' "未知命令：$1" > "${TRIM_TEMP_LOGFILE}" 2>/dev/null || true
+        exit 1
+        ;;
+esac

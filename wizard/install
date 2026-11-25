@@ -1,0 +1,37 @@
+[
+    {
+        "stepTitle": "存储与运行配置",
+        "items": [
+            {
+                "type": "radio",
+                "field": "wizard_data_library_type",
+                "label": "Hermes 存储位置",
+                "initValue": "data",
+                "options": [
+                    { "label": "共享目录 (Share) — 在文件管理里可见，便于备份", "value": "share" },
+                    { "label": "数据目录 (Data) — 应用私有目录，不暴露给用户", "value": "data" }
+                ],
+                "rules": [
+                    { "required": true, "message": "请选择存储位置" }
+                ]
+            },
+            {
+                "type": "radio",
+                "field": "wizard_dsh_run_user",
+                "label": "Hermes 运行权限",
+                "initValue": "package",
+                "options": [
+                    { "label": "普通用户 (Package) — 推荐，管理端可完整读写数据", "value": "package" },
+                    { "label": "超级管理员 (Root) — 数据归 root，快照/配置编辑等管理功能可能受限", "value": "root" }
+                ],
+                "rules": [
+                    { "required": true, "message": "请选择运行权限" }
+                ]
+            },
+            {
+                "type": "tips",
+                "helpText": "注意：相关配置仅限安装时选定，安装完成后请勿随意修改，否则可能引发权限异常、服务无法启动或数据丢失。"
+            }
+        ]
+    }
+]

@@ -1,0 +1,33 @@
+#!/bin/bash
+
+### 安装前检查：docker 必须存在；当前用户没有 docker 权限时只告警，不阻断安装。
+### Hermes 容器由应用中心在安装后调用 cmd/main 启动，镜像与编排的准备工作在 install_callback。
+
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+mkdir -p "${TRIM_PKGVAR}" 2>/dev/null || true
+
+log_msg() {
+    printf '%s - [install_init] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"${LOG_FILE}" 2>/dev/null || true
+}
+
+fail() {
+    log_msg "ERROR: $1"
+    printf '%s\n' "$1" > "${TRIM_TEMP_LOGFILE}" 2>/dev/null || true
+    exit 1
+}
+
+if ! command -v docker >/dev/null 2>&1; then
+    fail "未找到 docker 命令，无法安装 Hermes Agent。请先在应用中心确认 Docker 已正常安装。"
+fi
+
+if [ ! -S /var/run/docker.sock ]; then
+    fail "Docker 服务未运行（缺少 /var/run/docker.sock），请先启动 Docker。"
+fi
+
+if docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+    log_msg "docker 前置检查通过（服务端版本 $(docker version --format '{{.Server.Version}}' 2>/dev/null)）"
+else
+    log_msg "警告：当前用户无 docker 权限，安装期镜像预检将跳过，容器由应用启动流程处理"
+fi
+
+exit 0

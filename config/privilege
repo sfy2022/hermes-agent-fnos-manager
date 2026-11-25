@@ -1,0 +1,9 @@
+{
+    "defaults":
+    {
+        "run-as": "package"
+    },
+    "username": "docker-hermes-agent",
+    "groupname": "docker-hermes-agent",
+    "join-groups": ["docker"]
+}

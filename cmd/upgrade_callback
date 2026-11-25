@@ -1,0 +1,22 @@
+#!/bin/bash
+
+### 升级后：保留 var/ 与共享目录中的既有配置，由应用中心随后调用 cmd/main start 拉起新版。
+
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+ENV_FILE="${TRIM_PKGVAR}/config.env"
+
+log_msg() {
+    printf '%s - [upgrade_callback] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"${LOG_FILE}" 2>/dev/null || true
+}
+
+log_msg "=== upgrade_callback 开始（旧版本 ${TRIM_OLD_APPVER:-未知} → ${TRIM_APPVER:-未知}）==="
+
+if [ ! -s "${ENV_FILE}" ]; then
+    log_msg "ERROR: 运行配置缺失：${ENV_FILE}"
+    printf '%s\n' "运行配置缺失，无法在升级后恢复服务。请卸载后重新安装（共享目录会保留）。" > "${TRIM_TEMP_LOGFILE}" 2>/dev/null || true
+    exit 1
+fi
+
+log_msg "运行配置保留：${ENV_FILE}"
+log_msg "=== upgrade_callback 完成 ==="
+exit 0

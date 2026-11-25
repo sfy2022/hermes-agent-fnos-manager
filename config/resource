@@ -1,0 +1,15 @@
+{
+    "data-share": {
+        "shares": [
+            {
+                "name": "hermes-agent"
+            },
+            {
+                "name": "hermes-agent/data"
+            },
+            {
+                "name": "hermes-agent/workspace"
+            }
+        ]
+    }
+}

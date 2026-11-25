@@ -1,0 +1,794 @@
+#!/bin/bash
+#
+# cmd/install_callback —— 安装完成后生成运行时配置
+#
+# 职责（与包体架构师的契约一致）：
+#   1. 生成 ${TRIM_PKGVAR}/config.env —— 容器运行时环境变量（0600，裸值格式）
+#   2. 生成 ${TRIM_PKGVAR}/api_server.key —— OpenAI 兼容 API 的访问密钥（0600）
+#   3. 生成 ${TRIM_PKGVAR}/access-info.txt —— 给用户看的访问信息
+#   4. 建好数据目录、修正属主
+#   5. 把配置 apply 到容器（compose up -d，幂等）
+#
+# ⚠️ 时序（真机 E5 实测）：
+#   install_init → 文件落盘 → install_callback → fnOS 应用中心执行 docker compose up
+#   但 fnOS 的 compose up 与本回调**无顺序保证**（实测容器创建时间比
+#   env 文件写入时间早 105 毫秒）。所以本回调在写完 env 文件后必须
+#   自己再 apply 一次 —— 这样无论谁先谁后，最后一次 apply 一定读到了
+#   完整的配置文件。
+#
+# ⚠️ env 文件格式：compose 的 env_file 用 format: raw 解析（值按字面量），
+#   所以值**不能加引号**，也不能跨行。写入前统一做清洗。
+#
+# 幂等：重复安装（升级）时，已存在的密钥（BASIC_AUTH_SECRET / API_SERVER_KEY）
+#   会被保留，不会因为重装而让用户的会话失效或 API 客户端失联。
+
+APP_NAME="${TRIM_APPNAME:-hermes-agent}"
+APP_DIR="/var/apps/${APP_NAME}"
+VAR_DIR="${TRIM_PKGVAR:-${APP_DIR}/var}"
+DEST_DIR="${TRIM_APPDEST:-${APP_DIR}/target}"
+LOG_FILE="${VAR_DIR}/info.log"
+ENV_FILE="${VAR_DIR}/config.env"
+CHOICES_FILE="${VAR_DIR}/install-choices.env"
+
+choice_get() {
+    [ -r "${CHOICES_FILE}" ] || return 0
+    sed -n "s/^$1=//p" "${CHOICES_FILE}" 2>/dev/null | tail -n 1 | tr -d '\r'
+}
+
+DATA_LIBRARY_TYPE="${wizard_data_library_type:-}"
+[ -n "${DATA_LIBRARY_TYPE}" ] || DATA_LIBRARY_TYPE="$(choice_get data_library_type)"
+[ -n "${DATA_LIBRARY_TYPE}" ] || DATA_LIBRARY_TYPE="share"
+RUN_USER_CHOICE="${wizard_dsh_run_user:-}"
+[ -n "${RUN_USER_CHOICE}" ] || RUN_USER_CHOICE="$(choice_get run_user)"
+[ -n "${RUN_USER_CHOICE}" ] || RUN_USER_CHOICE="package"
+
+if [ "${DATA_LIBRARY_TYPE}" = "data" ]; then
+    DATA_DIR="${VAR_DIR}/data-root"
+    WORKSPACE_DIR="${VAR_DIR}/workspace-root"
+else
+    DATA_DIR="${APP_DIR}/shares/hermes-agent/data"
+    WORKSPACE_DIR="${APP_DIR}/shares/hermes-agent/workspace"
+fi
+API_KEY_FILE="${VAR_DIR}/api_server.key"
+ACCESS_FILE="${VAR_DIR}/access-info.txt"
+COMPOSE_FILE="${DEST_DIR}/docker/docker-compose.yaml"
+PROJECT_NAME="hermes-agent"
+# Desktop Webapp 的监听端口，必须与 manifest 的 service_port 和
+# app/ui/config 的 port 三处一致 —— 不一致的后果是静默的：宿主监听 A 端口、
+# 桌面入口指向 B 端口，图标点开就是空白，日志里一个错都没有（实测踩过）。
+# 实测：webapp 与 dashboard 共用同一个 listener（容器内只有一条 9121 监听记录）。
+# 镜像内 grep 核实：上游没有 HERMES_PORT / HERMES_WEBAPP_PORT / HERMES_DASHBOARD_PORT
+# 这些环境变量，端口唯一来源是 config.yaml 的 webapp.host / webapp.port。
+# 下面从已安装的 manifest 反查 service_port（fnpack 写的 manifest 是 CRLF，要剥掉 \r），
+# 查不到才用兜底值 —— 这样改端口只需改 manifest 一处。
+SERVICE_PORT="9121"
+if [ -f "${APP_DIR}/manifest" ]; then
+    _mp="$(sed -n 's/^[[:space:]]*service_port[[:space:]]*=[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' "${APP_DIR}/manifest" 2>/dev/null | head -n 1 | tr -d '\r')"
+    case "${_mp}" in
+        ''|*[!0-9]*) : ;;
+        *) SERVICE_PORT="${_mp}" ;;
+    esac
+fi
+
+LOG_TAG="${LOG_TAG:-install_callback}"
+
+# 把应用私有区的文件属主改成应用用户。
+# ⚠️ 真机实测（E5，2026-11-03）：var/ 下 0600 文件若属主是 root:root，
+#    upgrade_callback 以**应用用户**身份运行就读不到 → 「无法沿用已有配置」
+#    → **每次升级都 fail**。规范铁律 31 也要求 var/ 属主是应用用户。
+own_app_file() {
+    [ -n "${TRIM_USERNAME}" ] || return 0
+    chown "${TRIM_USERNAME}:${TRIM_GROUPNAME:-${TRIM_USERNAME}}" "$1" 2>/dev/null || true
+}
+
+log_msg() {
+    mkdir -p "${VAR_DIR}" 2>/dev/null || true
+    printf '%s - [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${LOG_TAG}" "$1" >>"${LOG_FILE}" 2>/dev/null || true
+}
+
+fail() {
+    log_msg "ERROR: $1"
+    if [ -n "${TRIM_TEMP_LOGFILE}" ]; then
+        printf '%s\n' "$1" >"${TRIM_TEMP_LOGFILE}" 2>/dev/null || true
+    fi
+    exit 1
+}
+
+# 读取已有 env 文件里的某个键（重装/升级时保留用户已有配置）
+env_get() {
+    local key="$1" val=""
+    if [ -r "${ENV_FILE}" ]; then
+        val="$(sed -n "s/^${key}=//p" "${ENV_FILE}" 2>/dev/null | tail -n 1)"
+    fi
+    printf '%s' "${val}"
+}
+
+# 清洗值：去掉换行与首尾空白（compose 的 dotenv 解析也会 trim，这里先统一）
+clean_value() {
+    printf '%s' "$1" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# 写一条 env（值为空则跳过）
+env_put() {
+    [ -n "$2" ] || return 0
+    # 写临时文件，最后由 mv 原子替换 —— 见第 4 节的原子写说明
+    printf '%s=%s\n' "$1" "$2" >>"${ENV_TMP}"
+}
+
+# 生成随机十六进制串
+gen_hex() {
+    local n="${1:-32}" out=""
+    if [ -r /dev/urandom ]; then
+        out="$(head -c "${n}" /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')"
+    fi
+    if [ -z "${out}" ]; then
+        out="$(date +%s%N 2>/dev/null | sha256sum 2>/dev/null | cut -c1-"${n}")"
+    fi
+    [ -n "${out}" ] || out="$(printf '%0${n}s' 0 | tr '0' 'x')"
+    printf '%s' "${out}"
+}
+
+log_msg "=== ${LOG_TAG} 开始 ==="
+
+# ── 凭据落盘策略（敏感变量不进容器 env）────────────────────────────────
+# 上游实测结论（官方镜像 v0.22.5 源码核对）：
+#   · 面板认证插件 plugins/dashboard_auth/basic：
+#       username/password_hash/password/secret 读「env 优先，否则 config.yaml 的
+#       dashboard.basic_auth.*」—— **不读 .env**。
+#       hash_password() 的 docstring 明确写着：
+#       "Public so operators can precompute password_hash for config.yaml
+#        (the plaintext then never sits at rest)" → 上游官方支持宿主预计算。
+#   · 模型服务商密钥：hermes_cli/config.py 的 get_env_value_prefer_dotenv()
+#       「优先 ~/.hermes/.env（即 $HERMES_HOME/.env），其次 os.environ」。
+#   · API_SERVER_KEY：gateway/platforms/api_server.py 用 get_secret()，
+#       同样走 $HERMES_HOME/.env 优先的取值链。
+#
+# → 落盘策略：
+#   ① 面板口令  → 宿主用 **标准库 hashlib.scrypt** 算哈希（参数与上游一致：
+#      N=2**14 r=8 p=1 dklen=32 salt=16，格式 scrypt$N$r$p$salt_b64$dk_b64），
+#      写进 ${DATA_DIR}/config.yaml 的 dashboard.basic_auth.password_hash。
+#      **明文口令不再进容器 env，也不再落 config.env**，只留在 var/access-info.txt。
+#   ② 面板会话密钥（HMAC）→ 同上，写进 config.yaml 的 dashboard.basic_auth.secret。
+#      它的泄露后果比口令更重（可伪造会话），所以必须一起移出 env。
+#   ③ 模型服务商 Key / API_SERVER_KEY / 平台 Bot Token → 写进
+#      ${DATA_DIR}/.env（= 容器内 $HERMES_HOME/.env，上游自己的密钥仓库）。
+#
+# 这样一来，**容器 env 里不再有任何明文密钥**（docker inspect 看不到），
+# 磁盘上只剩 scrypt 哈希（口令不可逆）与 .env（0600，属主是应用用户）。
+# 兜底：宿主没有 python3 时退回「明文进 env」的旧路（上游同样支持），
+#       保证任何环境下都能起来，只是密钥保护降级。
+
+# 用标准库算 scrypt 哈希（参数与上游 hash_password 完全一致）
+compute_password_hash() {
+    local pw="$1"
+    python3 - <<'PYEOF_HASH' 2>/dev/null
+import base64, hashlib, os, secrets, sys
+pw = os.environ.get("HERMES_PW", "")
+salt = secrets.token_bytes(16)
+dk = hashlib.scrypt(pw.encode("utf-8"), salt=salt, n=2**14, r=8, p=1, dklen=32, maxmem=0)
+print("scrypt$%d$%d$%d$%s$%s" % (2**14, 8, 1,
+      base64.b64encode(salt).decode(), base64.b64encode(dk).decode()))
+PYEOF_HASH
+}
+
+# 写数据目录的 .env（上游密钥仓库）；合并写入，不覆盖用户手改的其他项
+write_secret_env() {
+    local f="${DATA_DIR}/.env"
+    mkdir -p "${DATA_DIR}" "${WORKSPACE_DIR}" 2>/dev/null || true
+    [ -f "${f}" ] || : >"${f}" 2>/dev/null
+    chmod 600 "${f}" 2>/dev/null || true
+    own_app_file "${f}"
+    printf '%s' "$1" >>"${f}" 2>/dev/null || true
+}
+
+# 从数据目录的 .env（上游密钥仓库）读一个键
+secret_get() {
+    local key="$1" f="${DATA_DIR}/.env" val=""
+    [ -r "${f}" ] || return 0
+    val="$(sed -n "s/^${key}=//p" "${f}" 2>/dev/null | tail -n 1)"
+    printf '%s' "${val}"
+}
+
+secret_put() {
+    # $1=KEY $2=VALUE；值为空跳过；同名键先删后写（幂等）
+    [ -n "$2" ] || return 0
+    local key="$1" val="$2" f="${DATA_DIR}/.env"
+    [ -f "${f}" ] || : >"${f}" 2>/dev/null
+    if grep -q "^${key}=" "${f}" 2>/dev/null; then
+        # 用 | 做分隔符，值里的 / 不会误伤
+        sed -i "s|^${key}=.*|${key}=${val}|" "${f}" 2>/dev/null || true
+    else
+        printf '%s=%s\n' "${key}" "${val}" >>"${f}" 2>/dev/null || true
+    fi
+    chmod 600 "${f}" 2>/dev/null || true
+}
+
+
+# ── config.yaml 的 dashboard.basic_auth 段 ──────────────────────────────
+# 上游 basic 认证插件的取值顺序：**env 优先，其次 config.yaml 的
+# dashboard.basic_auth.{username,password_hash|password,secret,session_ttl_seconds}**。
+# 我们把口令哈希与会话密钥放这里 → 容器 env 里就没有任何明文密钥了。
+yaml_get() {
+    local section="$1" key="$2" file="${DATA_DIR}/config.yaml"
+    [ -r "${file}" ] || return 0
+    sed -n "/^${section}:/,/^[^[:space:]]/p" "${file}" 2>/dev/null \
+        | grep -E "^[[:space:]]*${key}:" | head -n 1 \
+        | sed -E "s/^[[:space:]]*${key}:[[:space:]]*//" \
+        | tr -d "\"'" | tr -d '\r'
+}
+
+# 写入/替换 dashboard 段（整个段由我们接管；上游其它段不受影响）
+yaml_set_dashboard() {
+    local file="${DATA_DIR}/config.yaml" user="$1" ph="$2" sec="$3" tmp="${file}.tmp"
+    [ -f "${file}" ] || printf '# Hermes Agent 配置\n' >"${file}"
+    if grep -q "^dashboard:" "${file}" 2>/dev/null; then
+        # 删掉旧段（含其缩进体），保留下一个顶层键
+        awk 'BEGIN{skip=0} /^dashboard:/{skip=1; next}
+             skip==1 && /^[^[:space:]]/{skip=0}
+             skip==0{print}' "${file}" >"${tmp}" 2>/dev/null && mv "${tmp}" "${file}"
+    fi
+    {
+        printf 'dashboard:\n'
+        printf '  basic_auth:\n'
+        printf '    username: %s\n' "${user}"
+        [ -n "${ph}" ] && printf '    password_hash: "%s"\n' "${ph}"
+        [ -n "${sec}" ] && printf '    secret: "%s"\n' "${sec}"
+    } >>"${file}" 2>/dev/null || true
+    chmod 600 "${file}" 2>/dev/null || true
+    own_app_file "${file}"
+}
+
+
+write_install_choices() {
+    mkdir -p "${VAR_DIR}" 2>/dev/null || true
+    local tmp="${CHOICES_FILE}.tmp.$$"
+    {
+        printf 'data_library_type=%s\n' "${DATA_LIBRARY_TYPE}"
+        printf 'run_user=%s\n' "${RUN_USER_CHOICE}"
+    } >"${tmp}" 2>/dev/null || return 0
+    chmod 600 "${tmp}" 2>/dev/null || true
+    own_app_file "${tmp}"
+    mv -f "${tmp}" "${CHOICES_FILE}" 2>/dev/null || true
+}
+
+# ── 安装边界 ─────────────────────────────────────────────────────────────
+# 本应用是「管理器」：fnOS 安装 fpk 只装管理端，Hermes 由用户在管理端里
+# 手动安装（管理端会带上 HERMES_MANAGER_INSTALL=1 调用本脚本）。
+# 因此 fnOS 安装流程直接走到这里时什么也不做。
+if [ "${HERMES_MANAGER_INSTALL:-0}" != "1" ]; then
+    write_install_choices
+    if [ "${DATA_LIBRARY_TYPE}" = "data" ]; then
+        mkdir -p "${DATA_DIR}" "${WORKSPACE_DIR}" 2>/dev/null || true
+    fi
+    log_msg "已记录安装向导选择（存储=${DATA_LIBRARY_TYPE}, 运行权限=${RUN_USER_CHOICE}），Hermes 待管理端安装"
+    exit 0
+fi
+
+write_install_choices
+
+# ── 0. 前置校验 ─────────────────────────────────────────────────────────
+if [ ! -f "${COMPOSE_FILE}" ]; then
+    fail "容器编排文件缺失：${COMPOSE_FILE}"
+fi
+# 镜像标签：由管理端按官方版本选择（如 v0.23.4-desktop）。
+# 应用版本与上游 Hermes 版本已解耦，不再做「与 manifest version 等值」校验。
+# 只拒绝 latest / stable / main 这类滚动通道，它们不保证可复现。
+image_ref="$(grep -E '^[[:space:]]*image:' "${COMPOSE_FILE}" 2>/dev/null | head -n 1 | awk '{print $2}')"
+if [ -n "${HERMES_IMAGE_TAG:-}" ]; then
+    image_tag="${HERMES_IMAGE_TAG}"
+elif printf '%s' "${image_ref}" | grep -q 'HERMES_DOCKER_IMAGE_TAG:-'; then
+    image_tag="$(printf '%s' "${image_ref}" | sed -n 's/.*HERMES_DOCKER_IMAGE_TAG:-\([^}]*\)}.*/\1/p')"
+else
+    image_tag="$(printf '%s' "${image_ref}" | sed -n 's/.*:\([^:]*\)$/\1/p')"
+fi
+case "${image_tag}" in
+    latest|latest-*|stable|main)
+        fail "镜像 tag（${image_tag}）是滚动通道，请在管理端选择具体的官方版本（如 v0.23.4-desktop）。"
+        ;;
+    *@sha256:*)
+        log_msg "镜像按摘要锁定：${image_tag}"
+        ;;
+    *)
+        log_msg "镜像标签：${image_tag}"
+        ;;
+esac
+
+# ── 1. 读取向导值（一律带默认值；开关用字符串比较）────────────────────
+DASH_USER="$(clean_value "${wizard_dashboard_username:-admin}")"
+DASH_PASS="$(clean_value "${wizard_dashboard_password:-}")"
+PROVIDER="$(clean_value "${wizard_provider:-openrouter}")"
+MODEL_KEY="$(clean_value "${wizard_api_key:-}")"
+BASE_URL="$(clean_value "${wizard_base_url:-}")"
+MODEL_NAME="$(clean_value "${wizard_model:-}")"
+ENABLE_API="$(clean_value "${wizard_enable_api:-true}")"
+API_PORT="$(clean_value "${wizard_api_port:-8642}")"
+API_KEY="$(clean_value "${wizard_api_server_key:-}")"
+ENABLE_GW="$(clean_value "${wizard_enable_gateway:-false}")"
+GW_PLATFORM="$(clean_value "${wizard_gateway_platform:-telegram}")"
+GW_TOKEN="$(clean_value "${wizard_gateway_token:-}")"
+GW_USERS="$(clean_value "${wizard_gateway_allowed_users:-}")"
+
+# 口令必填 —— 但「已有口令哈希」也算满足（配置变更 / 升级时向导口令留空 = 不修改）：
+#   · 新装：既没有新口令、也没有旧哈希 → 拒绝（Hermes 非回环绑定必须有认证提供者，
+#     否则面板进程直接 SystemExit）
+#   · 改配置 / 升级：向导口令留空 → 沿用 var/config.env 里已有的哈希（不重置口令）
+if [ -z "${DASH_PASS}" ] \
+    && [ -z "$(env_get HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH)" ] \
+    && [ -z "$(yaml_get dashboard password_hash)" ]; then
+    fail "未提供 Dashboard 访问密码。Hermes 在非回环地址（0.0.0.0）下必须注册认证提供者，否则进程会直接退出。"
+fi
+
+# ── 1b. 先把「要沿用的旧值」抓出来 ───────────────────────────────────────
+# ⚠️ 顺序很重要：第 4 节会 **截断重写** ${ENV_FILE}，
+#    所以任何「从旧文件沿用」的值都必须在截断之前读出来，否则升级后
+#    口令哈希 / 会话密钥 / API 密钥会被重置（用户被迫重新登录、API 客户端失联）。
+OLD_PASSWORD_HASH="$(env_get HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH)"
+[ -n "${OLD_PASSWORD_HASH}" ] || OLD_PASSWORD_HASH="$(yaml_get dashboard password_hash)"
+OLD_AUTH_SECRET="$(env_get HERMES_DASHBOARD_BASIC_AUTH_SECRET)"
+[ -n "${OLD_AUTH_SECRET}" ] || OLD_AUTH_SECRET="$(yaml_get dashboard secret)"
+# API 密钥的权威副本在数据目录的 .env（上游密钥仓库）
+OLD_API_KEY="$(secret_get API_SERVER_KEY)"
+
+# ── 2. 目录与属主 ───────────────────────────────────────────────────────
+mkdir -p "${VAR_DIR}" "${DATA_DIR}" 2>/dev/null || true
+mkdir -p "${WORKSPACE_DIR}" 2>/dev/null || true
+
+APP_UID="${TRIM_UID:-}"
+APP_GID="${TRIM_GID:-}"
+if [ "${RUN_USER_CHOICE}" = "root" ]; then
+    APP_UID="0"
+    APP_GID="0"
+fi
+if [ "${RUN_USER_CHOICE}" != "root" ] && [ -z "${APP_UID}" ] && [ -n "${TRIM_USERNAME}" ]; then
+    APP_UID="$(id -u "${TRIM_USERNAME}" 2>/dev/null)"
+fi
+if [ "${RUN_USER_CHOICE}" != "root" ] && [ -z "${APP_GID}" ] && [ -n "${TRIM_GROUPNAME}" ]; then
+    APP_GID="$(id -g "${TRIM_GROUPNAME}" 2>/dev/null)"
+fi
+[ -n "${APP_UID}" ] || APP_UID="1000"
+[ -n "${APP_GID}" ] || APP_GID="1000"
+
+
+# ── 3. 密钥：沿用旧的，没有就新生成 ───────────────────────────────────
+# 会话密钥（HMAC 签名用）：存 config.yaml 的 dashboard.basic_auth.secret，
+# 不再进 config.env —— 它的泄露后果比口令更重（可伪造会话 cookie）。
+OLD_SECRET="${OLD_AUTH_SECRET}"
+if [ -n "${OLD_SECRET}" ]; then
+    AUTH_SECRET="${OLD_SECRET}"
+    log_msg "沿用已有的 Dashboard 会话密钥"
+else
+    # 上游接受 base64 / hex / 原文三种；官方建议 openssl rand -base64 32
+    AUTH_SECRET="$(head -c 32 /dev/urandom 2>/dev/null | base64 -w0 2>/dev/null || gen_hex 32)"
+    log_msg "生成新的 Dashboard 会话密钥（32 字节）"
+fi
+
+if [ -n "${API_KEY}" ]; then
+    :
+elif [ -n "${OLD_API_KEY}" ]; then
+    API_KEY="${OLD_API_KEY}"
+    log_msg "沿用已有的 API Server 密钥"
+else
+    API_KEY="$(gen_hex 16)"
+    log_msg "生成新的 API Server 密钥（16 字节）"
+fi
+
+# ── 4. 写 env 文件（compose env_file，format: raw，裸值）────────────────
+# ⚠️ 原子写：先写临时文件再 mv 覆盖。
+#    直接 `> "${ENV_FILE}"` 是「截断 + 逐行写」，而 compose 可能**同时**在读它
+#    （安装期 fnOS 的 compose up 与本回调并发）→ 读到半截文件 → compose 报
+#    "decoding failed" 或容器拿到半套配置 → 症状随机、极难复现。
+#    mv 在同一文件系统内是原子的（rename）→ 读者只会看到「完整的旧版」或「完整的新版」。
+ENV_TMP="${ENV_FILE}.tmp.$$"
+# ⚠️ 本次写入全部落到 ENV_TMP，最后统一 mv 覆盖 ——
+#    env_put() 与下面的头部块都写 ENV_TMP，绝不直接写 ENV_FILE。
+: >"${ENV_TMP}" 2>/dev/null || fail "无法写入配置文件：${ENV_FILE}"
+
+{
+    printf '# Hermes Agent Desktop 运行时环境变量\n'
+    printf '# 由 cmd/install_callback / cmd/config_callback / cmd/upgrade_callback 生成。\n'
+    printf '# 本文件含明文密钥，权限 0600，请勿外传、不要提交到代码仓库。\n'
+    printf '# 格式：KEY=VALUE，值按字面量解析（compose env_file format: raw），\n'
+    printf '#       因此值里不要加引号，也不能换行。\n'
+} >>"${ENV_TMP}"
+
+env_put HERMES_HOME "/opt/data"
+
+# ── XDG 目录指向持久卷 ────────────────────────────────────────────────
+# 真机实测（E5）：fnOS 应用用户的家目录是 /home/<appname>，该路径**并不存在**
+# （真实目录是 /vol1/@apphome/<appname>）；容器内 HOME=/root（s6 init 上下文）。
+# XDG 变量未设时，Hermes 的 ~/.config、~/.local/share、~/.cache 会落到
+# /root/... —— 那是容器 overlay 层，**容器重建即丢**（非持久）。
+# → 显式指向 /opt/data，与 HERMES_HOME 同一持久卷。
+env_put XDG_CONFIG_HOME "/opt/data/.config"
+env_put XDG_DATA_HOME "/opt/data/.local/share"
+env_put XDG_STATE_HOME "/opt/data/.local/state"
+env_put XDG_CACHE_HOME "/opt/data/.cache"
+env_put HERMES_UID "${APP_UID}"
+env_put HERMES_GID "${APP_GID}"
+
+# ── Desktop Webapp 渲染层（关键）────────────────────────────────────────
+# 上游官方环境变量（hermes_cli/webapp.py: DIST_ENV = "HERMES_WEBAPP_DIST"）。
+# 指向镜像内官方构建的 Desktop Webapp bundle：
+#   /opt/hermes/apps/desktop/dist-webapp  （assets 1060 个，47 MB）
+# 设了它，Hermes 直接伺服现成 bundle，绝不运行时自建（那需要 Node 26 与源码）。
+# 不设的话 webapp 会退化到 <project_root>/apps/desktop/dist-webapp —— 容器里
+# 没有源码树，结果就是「只有简化 Dashboard，没有 Desktop 界面」。
+env_put HERMES_WEBAPP_DIST "/opt/hermes/apps/desktop/dist-webapp"
+
+# ── 端口 ────────────────────────────────────────────────────────────────
+# 端口**不写进容器 env**：
+#   镜像内核实（NousResearch/hermes-agent main-desktop）没有 HERMES_PORT /
+#   HERMES_WEBAPP_PORT / HERMES_WEBAPP_HOST / HERMES_DASHBOARD_PORT 这些变量，
+#   监听地址唯一来源是 config.yaml 的 webapp.host / webapp.port
+#   （gateway/webapp_listener.py 的 listener_plan）。
+#   把它们写进 env 只会造成「改了没生效」的错觉；真正的写入在第 4b 节。
+# 用户名不是密钥，留 env 里（上游 basic 插件 env 优先，能兜住 config.yaml 被改坏）
+env_put HERMES_DASHBOARD_BASIC_AUTH_USERNAME "${DASH_USER}"
+env_put API_SERVER_ENABLED "${ENABLE_API}"
+env_put API_SERVER_HOST "0.0.0.0"
+env_put API_SERVER_PORT "${API_PORT}"
+env_put API_SERVER_CORS_ORIGINS "*"
+# ⚠️ 口令与会话密钥**不进 env**：见上方「凭据落盘策略」。
+#    口令 → config.yaml 的 dashboard.basic_auth.password_hash（宿主算好的 scrypt）
+#    会话密钥 → config.yaml 的 dashboard.basic_auth.secret
+#    API_SERVER_KEY 与各平台密钥 → ${DATA_DIR}/.env（上游自己的密钥仓库）
+secret_put API_SERVER_KEY "${API_KEY}"
+
+# 模型服务商 → 上游环境变量（变量名已对照官方镜像 v0.22.5 源码核实）
+case "${PROVIDER}" in
+    openrouter)
+        secret_put OPENROUTER_API_KEY "${MODEL_KEY}"
+        env_put OPENROUTER_BASE_URL "${BASE_URL}"
+        ;;
+    openai)
+        secret_put OPENAI_API_KEY "${MODEL_KEY}"
+        env_put OPENAI_BASE_URL "${BASE_URL}"
+        ;;
+    anthropic)
+        secret_put ANTHROPIC_API_KEY "${MODEL_KEY}"
+        env_put ANTHROPIC_BASE_URL "${BASE_URL}"
+        ;;
+    deepseek)
+        secret_put DEEPSEEK_API_KEY "${MODEL_KEY}"
+        env_put DEEPSEEK_BASE_URL "${BASE_URL}"
+        ;;
+    kimi)
+        secret_put KIMI_API_KEY "${MODEL_KEY}"
+        env_put KIMI_BASE_URL "${BASE_URL}"
+        ;;
+    glm)
+        secret_put GLM_API_KEY "${MODEL_KEY}"
+        env_put GLM_BASE_URL "${BASE_URL}"
+        ;;
+    custom)
+        secret_put OPENAI_API_KEY "${MODEL_KEY}"
+        env_put OPENAI_BASE_URL "${BASE_URL}"
+        ;;
+    *)
+        fail "未知的模型服务商：${PROVIDER}"
+        ;;
+esac
+env_put HERMES_MODEL "${MODEL_NAME}"
+env_put HERMES_PROVIDER "${PROVIDER}"
+
+# 消息平台 → 上游环境变量（变量名已对照官方镜像 v0.22.5 源码核实）
+if [ "${ENABLE_GW}" = "true" ]; then
+    case "${GW_PLATFORM}" in
+        telegram)
+            secret_put TELEGRAM_BOT_TOKEN "${GW_TOKEN}"
+            env_put TELEGRAM_ALLOWED_USERS "${GW_USERS}"
+            ;;
+        discord)
+            secret_put DISCORD_BOT_TOKEN "${GW_TOKEN}"
+            env_put DISCORD_ALLOWED_USERS "${GW_USERS}"
+            ;;
+        slack)
+            secret_put SLACK_BOT_TOKEN "${GW_TOKEN}"
+            env_put SLACK_ALLOWED_USERS "${GW_USERS}"
+            ;;
+        wecom)
+            secret_put WECOM_SECRET "${GW_TOKEN}"
+            env_put WECOM_ALLOWED_USERS "${GW_USERS}"
+            ;;
+        matrix)
+            secret_put MATRIX_ACCESS_TOKEN "${GW_TOKEN}"
+            env_put MATRIX_ALLOWED_USERS "${GW_USERS}"
+            ;;
+        teams)
+            secret_put TEAMS_CLIENT_ID "${GW_TOKEN}"
+            env_put TEAMS_CLIENT_SECRET "${GW_TOKEN}"
+            env_put TEAMS_ALLOWED_USERS "${GW_USERS}"
+            ;;
+        google-chat)
+            secret_put GOOGLE_CHAT_SERVICE_ACCOUNT_JSON "${GW_TOKEN}"
+            env_put GOOGLE_CHAT_ALLOWED_USERS "${GW_USERS}"
+            ;;
+        *)
+            fail "未知的消息平台：${GW_PLATFORM}"
+            ;;
+    esac
+    log_msg "已启用消息网关：${GW_PLATFORM}"
+fi
+
+
+
+# ── compose 插值通道（同目录 .env）─────────────────────────────────────
+# mem_limit / image tag 这类是**编排级字段**，走的是 compose 的插值通道
+# （同目录 .env），而不是服务的 env_file 通道。
+# 这里只放不含密钥的量；密钥全部在 var/config.env。
+COMPOSE_ENV_FILE="${DEST_DIR}/docker/.env"
+# 这三个值必须与 compose 里的 ${VAR:-默认值} 槽位**逐字一致**，
+# 否则用户在 .env 里改的值会与 manifest 的描述分叉。
+IMAGE_REPO="nousresearch/hermes-agent"
+IMAGE_TAG="${HERMES_IMAGE_TAG:-main-desktop}"
+CONTAINER_NAME="hermes-agent"
+MEM_LIMIT="$(clean_value "${wizard_memory_limit:-3072}")"
+# .env 只存纯数字，单位由 compose 模板负责（见 upgrade_callback 同名注释）
+MEM_LIMIT="$(printf '%s' "${MEM_LIMIT}" | tr -d 'gGmM')"
+case "${MEM_LIMIT}" in
+    ''|*[!0-9]*) MEM_LIMIT="3072" ;;
+esac
+
+# ── 镜像可用性：本地有就用，没有才拉；拉取按「镜像加速站 → 官方」顺序 ────
+#
+# 为什么需要这段（真机实测）：
+#   main-desktop 是滚动标签，不保证每台机器都有；且直连 registry-1.docker.io
+#   在部分网络下会超时：
+#     Get "https://registry-1.docker.io/v2/": net/http: request canceled ...
+#   → 安装界面卡在 Pulling fs layer，最后 compose up 失败。
+#
+#   策略（顺序固定，避免每次都先等官方仓库超时）：
+#     ① 本地已有官方 tag                    → 直接用，零网络
+#     ② 本地没有 → 先镜像加速站，再官方仓库  → 成功后 tag 成官方名
+#     ③ 两者都失败 → 回退本地已有的 *-desktop（同渲染层）
+#     ④ 本地也没有 → fail 并给出可复制的修复命令，避免「装完打不开」的静默失败
+#
+#   镜像约 3.75 GB；已存在时整段逻辑跳过，不产生网络请求。
+IMAGE_PULL_TIMEOUT="${IMAGE_PULL_TIMEOUT:-900}"
+IMAGE_MIRROR="${IMAGE_MIRROR:-docker.m.daocloud.io}"
+CANONICAL_IMAGE="${IMAGE_REPO}:${IMAGE_TAG}"
+
+image_local_exists() {
+    docker image inspect "$1" >/dev/null 2>&1
+}
+
+pull_image() {
+    log_msg "拉取镜像：$1（最长 ${IMAGE_PULL_TIMEOUT} 秒）"
+    timeout "${IMAGE_PULL_TIMEOUT}" docker pull "$1" >>"${LOG_FILE}" 2>&1
+}
+
+if image_local_exists "${CANONICAL_IMAGE}"; then
+    log_msg "镜像 ${CANONICAL_IMAGE} 本地已存在，直接使用（无需联网）"
+elif command -v docker >/dev/null 2>&1 && docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+    image_ready=""
+    if pull_image "${IMAGE_MIRROR}/${IMAGE_REPO}:${IMAGE_TAG}"; then
+        if docker tag "${IMAGE_MIRROR}/${IMAGE_REPO}:${IMAGE_TAG}" "${CANONICAL_IMAGE}" 2>/dev/null; then
+            image_ready="镜像加速站 ${IMAGE_MIRROR}"
+        fi
+    fi
+    if [ -z "${image_ready}" ] && pull_image "${CANONICAL_IMAGE}"; then
+        image_ready="官方仓库"
+    fi
+    if [ -n "${image_ready}" ]; then
+        log_msg "镜像就绪：${CANONICAL_IMAGE}（来源：${image_ready}）"
+    else
+        fail "无法获取镜像 ${CANONICAL_IMAGE}。请先在 Docker 中执行：docker pull ${IMAGE_MIRROR}/${IMAGE_REPO}:${IMAGE_TAG} && docker tag ${IMAGE_MIRROR}/${IMAGE_REPO}:${IMAGE_TAG} ${CANONICAL_IMAGE}，然后重试。"
+    fi
+else
+    log_msg "警告：docker 不可用，跳过镜像预检"
+fi
+
+mkdir -p "${DEST_DIR}/docker" 2>/dev/null || true
+{
+    printf '# Hermes Agent —— compose 插值通道（不含密钥）\n'
+    printf '# 由 cmd/install_callback / cmd/upgrade_callback 生成\n'
+    printf 'HERMES_DOCKER_MEMORY=%s\n' "${MEM_LIMIT}"
+    # ⚠️ compose 的 ${VAR} 插值**不读 env_file**，它读「项目目录下的 .env」
+    #    （即 target/docker/.env）。所以镜像仓库 / tag / 容器名必须写在这里，
+    #    否则用户在 .env 里选 tag 的通路是断的（compose 会用自己的默认值），
+    #    实际拉的镜像与用户以为的不一致。
+    printf 'HERMES_DOCKER_IMAGE_REPO=%s\n' "${IMAGE_REPO}"
+    printf 'HERMES_DOCKER_IMAGE_TAG=%s\n' "${IMAGE_TAG}"
+    printf 'HERMES_DOCKER_CONTAINER=%s\n' "${CONTAINER_NAME}"
+    printf 'HERMES_DATA_HOST=%s\n' "${DATA_DIR}"
+    printf 'HERMES_WORKSPACE_HOST=%s\n' "${WORKSPACE_DIR}"
+} >"${COMPOSE_ENV_FILE}.tmp.$$" 2>/dev/null || true
+# 同样原子替换：compose 的插值通道在写的同时可能被读
+mv -f "${COMPOSE_ENV_FILE}.tmp.$$" "${COMPOSE_ENV_FILE}" 2>/dev/null || true
+chmod 644 "${COMPOSE_ENV_FILE}" 2>/dev/null || true
+log_msg "compose 插值配置已写入：${COMPOSE_ENV_FILE}（mem_limit=${MEM_LIMIT}m）"
+
+# ── 4b. config.yaml 的 webapp: 段（Desktop 能否加载的总开关）────────────
+# 上游 gateway/webapp_listener.py 明确：
+#   "webapp.enabled in the gateway home's config.yaml turns it on."
+#   enabled 必须是布尔 true（不是 "true" 字符串）——否则读作关闭。
+#   host 必须是本地地址或通配符；port 必须 1-65535 的整数。
+#   缺失/不可读/格式错误的 webapp: 段一律读作「关闭」→ 只有简化 Dashboard。
+#
+# ⚠️ 端口归属（真机实测，参考实现确证）：
+#   Desktop Webapp 有**自己的监听端口**，由 config.yaml 的 webapp.port 决定，
+#   上游默认值是 9120（WebappSettings.DEFAULT_PORT）。
+#   SERVICE_PORT 是 Desktop 与面板共用的唯一监听端口 —— 与 manifest service_port 恒等。
+#   参考实现实测：webapp.port=9120 且容器只监听 9120。
+#   → 所以 Desktop 的访问端口 = webapp.port，必须与 manifest service_port、
+#     app/ui/config 的 port 三处一致（env 里没有端口变量）。
+#
+# 幂等：已存在 webapp: 段时只同步端口，绝不覆盖用户的其他自定义配置。
+CONFIG_FILE="${DATA_DIR}/config.yaml"
+mkdir -p "${DATA_DIR}" 2>/dev/null || true
+[ -f "${CONFIG_FILE}" ] || printf '# Hermes Agent 配置\n' >"${CONFIG_FILE}"
+
+WEBAPP_PORT="${SERVICE_PORT}"
+
+if grep -q "^webapp:" "${CONFIG_FILE}" 2>/dev/null; then
+    # 已有 webapp 段：把端口同步为本次使用的值。
+    # 不同步会导致「配置的端口」与「桌面入口使用的端口」不一致，
+    # 典型症状是启动后该端口不监听、fnOS 报启动失败。
+    cur_port="$(sed -n '/^webapp:/,/^[^[:space:]]/p' "${CONFIG_FILE}" 2>/dev/null \
+        | grep -E "^[[:space:]]*port:" | head -n 1 | grep -oE '[0-9]+')"
+    if [ -n "${cur_port}" ] && [ "${cur_port}" != "${WEBAPP_PORT}" ]; then
+        sed -i "/^webapp:/,/^[^[:space:]]/ s/^\([[:space:]]*port:[[:space:]]*\)[0-9]\{1,5\}/\1${WEBAPP_PORT}/" \
+            "${CONFIG_FILE}" 2>/dev/null || true
+        log_msg "config.yaml 的 webapp.port 已从 ${cur_port} 同步为 ${WEBAPP_PORT}"
+    else
+        log_msg "config.yaml 已含 webapp: 段（保留现有配置）"
+    fi
+    # 确保 enabled 为布尔 true（用户可能手工改过）
+    if ! sed -n '/^webapp:/,/^[^[:space:]]/p' "${CONFIG_FILE}" 2>/dev/null \
+        | grep -qE "^[[:space:]]*enabled:[[:space:]]*true[[:space:]]*$"; then
+        sed -i "/^webapp:/,/^[^[:space:]]/ s/^\([[:space:]]*enabled:[[:space:]]*\).*/\1true/" \
+            "${CONFIG_FILE}" 2>/dev/null || true
+        log_msg "config.yaml 的 webapp.enabled 已置为 true（Desktop 加载开关）"
+    fi
+else
+    cat >>"${CONFIG_FILE}" <<EOF
+
+# ── Hermes Agent Desktop（fnOS 容器版）────────────────────────────────
+# webapp 段是 Desktop 渲染层的加载开关，也是 Desktop 的监听端口配置。
+# 上游：gateway/webapp_listener.py —— "webapp.enabled in the gateway home's
+# config.yaml turns it on."；缺失或格式错误一律读作关闭（只剩简化 Dashboard）。
+# enabled 必须是布尔 true；host 用 0.0.0.0 供局域网访问；
+# port 必须与 manifest service_port / app/ui/config 的 port 一致。
+webapp:
+  enabled: true
+  host: 0.0.0.0
+  port: ${WEBAPP_PORT}
+EOF
+    log_msg "config.yaml 已写入 webapp: 段（Desktop 渲染层已开启，端口 ${WEBAPP_PORT}）"
+fi
+chmod 600 "${CONFIG_FILE}" 2>/dev/null || true
+
+# ── 4c. 面板认证：口令哈希 + 会话密钥写进 config.yaml ───────────────────
+# 明文口令**不落 config.env、不进容器 env**，只留在 var/access-info.txt。
+# 宿主用标准库 hashlib.scrypt 算哈希（参数与上游 hash_password 一致）。
+PASSWORD_HASH=""
+if [ -n "${DASH_PASS}" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        PASSWORD_HASH="$(HERMES_PW="${DASH_PASS}" compute_password_hash)"
+    fi
+    if [ -n "${PASSWORD_HASH}" ]; then
+        # 上游明确支持 HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH（plugins/dashboard_auth/basic）：
+        #   「Env ... _PASSWORD_HASH / _PASSWORD / _SECRET ... win when non-empty」
+        # → 容器 env 里放的是**哈希**，明文口令永远不进容器环境变量。
+        env_put HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH "${PASSWORD_HASH}"
+        log_msg "面板口令已转为 scrypt 哈希（明文不进容器环境变量）"
+    else
+        # 兜底：宿主没有 python3 → 退回上游同样支持的「明文进 env」旧路
+        log_msg "警告：宿主无 python3，无法计算口令哈希，退回明文口令进环境变量"
+        env_put HERMES_DASHBOARD_BASIC_AUTH_PASSWORD "${DASH_PASS}"
+    fi
+else
+    # 没给新口令（升级 / 重装场景）→ 沿用**已有**的哈希，绝不覆盖。
+    # 权威副本在 var/config.env（compose 的 env_file 通道，升级不丢）；
+    # config.yaml 只是兜底 —— 上游会重写它，宿主写入的段会被覆盖掉。
+    PASSWORD_HASH="${OLD_PASSWORD_HASH}"
+    if [ -n "${PASSWORD_HASH}" ]; then
+        env_put HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH "${PASSWORD_HASH}"
+        log_msg "沿用已有的面板口令哈希（升级不重置口令）"
+    fi
+fi
+
+# 会话签名密钥（HMAC）：**必须持久且无条件写入** —— 它一旦丢失，
+# 容器每次重启都会随机生成新密钥 → 用户所有会话 cookie 立即失效。
+# 为什么只能放 env：上游会在运行时重写 config.yaml（真机实测：宿主写入的
+# dashboard 段会被上游的 schema 迁移 / 配置保存覆盖掉）→ config.yaml 不是可靠通道。
+env_put HERMES_DASHBOARD_BASIC_AUTH_SECRET "${AUTH_SECRET}"
+# 同步写一份 config.yaml 作为兜底。注意：**不持久** ——
+# 真机实测上游会重写 config.yaml（schema 迁移 / 配置保存），
+# 我们写入的 dashboard 段会被覆盖掉；真正生效的是 env 里的 _PASSWORD_HASH。
+yaml_set_dashboard "${DASH_USER}" "${PASSWORD_HASH}" "${AUTH_SECRET}"
+
+# ── 4d. 原子提交：所有 env_put 都完成后，才把临时文件 mv 覆盖正式文件 ──────
+# ⚠️ 这个 mv 必须是**最后一次**写 ENV_TMP 的操作之后。
+#    之前它排在 4c（口令哈希 / 会话密钥）之前 → 那两项写进了临时文件、
+#    而临时文件已经被移走 → **口令哈希与会话密钥被静默丢弃** →
+#    面板既没有哈希也没有口令 → 回退到上游的固定默认口令（安全洞）。
+#    教训：原子写的「提交点」必须放在**所有**写入之后，不能放在中间。
+chmod 600 "${ENV_TMP}" 2>/dev/null || true
+# ⚠️ 属主必须是**应用用户**（规范铁律 31）。
+#    真机实测（E5）：属主留成 root:root + 0600 时，
+#    upgrade_callback 以应用用户身份运行读不到本文件 →
+#    「无法沿用已有配置」→ **每次升级都 fail** → 归一化修复永远执行不到。
+#    mv 会保留属主，所以 chown 必须放在 mv **之前**。
+own_app_file "${ENV_TMP}"
+mv -f "${ENV_TMP}" "${ENV_FILE}" 2>/dev/null || {
+    rm -f "${ENV_TMP}" 2>/dev/null || true
+    fail "无法写入配置文件：${ENV_FILE}"
+}
+chmod 600 "${ENV_FILE}" 2>/dev/null || true
+# 兜底：mv 后再确认一次属主（mv 保留属主，上面已 chown 过，这里防御性补一次）
+own_app_file "${ENV_FILE}"
+log_msg "运行时配置已写入：${ENV_FILE}（属主 ${TRIM_USERNAME:-未知}，含面板口令哈希与会话密钥）"
+
+# ── 5. API 密钥单独存一份，方便用户查阅 ─────────────────────────────────
+printf '%s\n' "${API_KEY}" >"${API_KEY_FILE}" 2>/dev/null || true
+chmod 600 "${API_KEY_FILE}" 2>/dev/null || true
+own_app_file "${API_KEY_FILE}"
+
+# ── 6. 访问信息 ─────────────────────────────────────────────────────────
+{
+    printf 'Hermes Agent Desktop 访问信息\n'
+    printf '=============================\n\n'
+    printf 'Desktop : http://<本机IP>:%s/\n' "${WEBAPP_PORT}"
+    printf '用户名   : %s\n' "${DASH_USER}"
+    printf '密码     : %s\n' "${DASH_PASS}"
+    printf '\n'
+    printf '说明：这是官方 Hermes Desktop 的完整工作区界面（对话流式输出、\n'
+    printf '      工具调用可视化、并排预览、文件浏览、Artifacts、定时任务、\n'
+    printf '      多 Profile、技能管理、终端栏、Git 审阅），由 gateway 内建\n'
+    printf '      的 Desktop 渲染层提供，与官方 Windows / macOS 版同一套 UI 代码。\n'
+    printf '\n'
+    if [ "${ENABLE_API}" = "true" ]; then
+        printf 'OpenAI 兼容 API : http://<本机IP>:%s/v1\n' "${API_PORT}"
+        printf 'API 密钥        : %s\n' "${API_KEY}"
+        printf '（同一份密钥另存于 %s）\n' "${API_KEY_FILE}"
+        printf '\n'
+    fi
+    printf '模型服务商 : %s\n' "${PROVIDER}"
+    [ -n "${MODEL_NAME}" ] && printf '模型       : %s\n' "${MODEL_NAME}"
+    [ "${ENABLE_GW}" = "true" ] && printf '消息网关   : %s\n' "${GW_PLATFORM}"
+    printf '\n'
+    printf '数据目录 : %s （容器内 /opt/data，卸载保留）\n' "${DATA_DIR}"
+    printf '工作目录 : %s （容器内 /opt/workspace）\n' "${WORKSPACE_DIR}"
+    printf '\n'
+    printf '提示：容器首次启动会初始化配置，Dashboard 可能需要 30~90 秒才可访问。\n'
+} >"${ACCESS_FILE}" 2>/dev/null || true
+chmod 600 "${ACCESS_FILE}" 2>/dev/null || true
+
+# ── 7. 属主：容器内进程以 HERMES_UID/HERMES_GID 运行，必须能写 ──────────
+if [ "$(id -u)" = "0" ] && [ -n "${TRIM_USERNAME}" ]; then
+    if [ "${RUN_USER_CHOICE}" = "root" ]; then
+        chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME:-${TRIM_USERNAME}}" "${VAR_DIR}" 2>/dev/null || true
+    else
+        chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME:-${TRIM_USERNAME}}" \
+            "${VAR_DIR}" "${DATA_DIR}" "${WORKSPACE_DIR}" 2>/dev/null || true
+    fi
+fi
+chmod 700 "${DATA_DIR}" 2>/dev/null || true
+
+# ── 8. 编排文件自检 ─────────────────────────────────────────────────────
+# 只验证 compose 文件能加载，不启动容器 —— 容器由 cmd/main 在应用启动时拉起。
+# 这里必须自检：YAML 语法错、单位重复（`3072mm`）、插值出坏值，
+# 都只有 `docker compose config` 能提前抓到，否则要到用户点开管理端才发现起不来。
+compose_config_check() {
+    command -v docker >/dev/null 2>&1 || { log_msg "提示：无 docker 权限，跳过编排文件自检"; return 0; }
+    docker version --format '{{.Server.Version}}' >/dev/null 2>&1 || {
+        log_msg "提示：无 docker socket 权限，跳过编排文件自检"
+        return 0
+    }
+    local err_file="${VAR_DIR}/compose-config.err" msg=""
+    if docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" config >/dev/null 2>"${err_file}"; then
+        rm -f "${err_file}" 2>/dev/null || true
+        log_msg "编排文件自检通过（docker compose config 成功）"
+        return 0
+    fi
+    [ -r "${err_file}" ] && msg="$(head -c 500 "${err_file}" 2>/dev/null | tr '\n' ' ')"
+    rm -f "${err_file}" 2>/dev/null || true
+    log_msg "ERROR: 编排文件无法加载：${msg}"
+    fail "容器编排文件无法加载：${msg}"
+}
+
+compose_config_check
+
+log_msg "=== ${LOG_TAG} 完成 ==="
+exit 0

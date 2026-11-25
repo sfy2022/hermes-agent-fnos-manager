@@ -1,0 +1,34 @@
+#!/bin/bash
+
+### 卸载后清理：只有用户在向导里选择「删除所有数据」时才动数据目录。
+
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+
+log_msg() {
+    printf '%s - [uninstall_callback] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"${LOG_FILE}" 2>/dev/null || true
+}
+
+ACTION="${wizard_data_action:-keep}"
+log_msg "=== uninstall_callback 开始（数据处理：${ACTION}）==="
+
+if [ "${ACTION}" = "delete" ]; then
+    # 共享目录：只删除本应用声明过的路径，避免误伤其他共享。
+    IFS=':' read -r -a SHARE_PATHS <<< "${TRIM_DATA_SHARE_PATHS:-}"
+    for path in "${SHARE_PATHS[@]}"; do
+        [ -n "${path}" ] || continue
+        case "${path}" in
+            */hermes-agent|*/hermes-agent/*)
+                rm -rf "${path}" && log_msg "已删除共享目录：${path}"
+                ;;
+        esac
+    done
+    # 运行配置与日志
+    if [ -n "${TRIM_PKGVAR}" ]; then
+        rm -rf "${TRIM_PKGVAR}" && log_msg "已删除应用数据目录：${TRIM_PKGVAR}"
+    fi
+else
+    log_msg "保留数据：共享目录与应用数据目录均未改动"
+fi
+
+log_msg "=== uninstall_callback 完成 ==="
+exit 0

@@ -1,0 +1,33 @@
+name: build-fpk
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix frontend
+
+      - name: Build manager frontend
+        run: npm run build --prefix frontend
+
+      - name: Build fpk
+        run: ./tools/fnpack build -d .
+
+      - name: Upload fpk
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-agent-fpk
+          path: hermes-agent.fpk
