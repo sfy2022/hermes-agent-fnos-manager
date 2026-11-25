@@ -296,6 +296,36 @@ function pullPercent(line) {
   installJob.percent = Math.max(installJob.percent, Math.min(99, Math.max(...matches)))
 }
 
+async function pullImage(tag, { onLine, timeout = 1800000 } = {}) {
+  const mirror = (await getAppSettings()).imageMirror
+  const canonical = `${IMAGE_REPO}:${tag}`
+  const candidates = []
+  if (mirror === 'docker.fnnas.com') {
+    candidates.push({ ref: canonical, source: '飞牛官方镜像源', tag: false })
+    candidates.push({ ref: `docker.m.daocloud.io/${IMAGE_REPO}:${tag}`, source: 'DaoCloud 加速站', tag: true })
+  } else {
+    candidates.push({ ref: `${mirror}/${IMAGE_REPO}:${tag}`, source: mirror, tag: true })
+    candidates.push({ ref: canonical, source: '官方仓库', tag: false })
+  }
+  let lastOutput = ''
+  for (const candidate of candidates) {
+    if (onLine) onLine(`拉取镜像：${candidate.ref}（${candidate.source}）`)
+    let code
+    if (onLine) {
+      code = await spawnStream('docker', ['pull', candidate.ref], process.env, onLine)
+    } else {
+      const r = await run('docker', ['pull', candidate.ref], { timeout })
+      code = r.code
+      lastOutput = `${r.stderr || ''}${r.stdout || ''}`.slice(-400)
+    }
+    if (code === 0) {
+      if (candidate.tag) await run('docker', ['tag', candidate.ref, canonical], { timeout: 30000 })
+      return { ok: true, source: candidate.source, ref: candidate.ref }
+    }
+  }
+  return { ok: false, output: lastOutput }
+}
+
 async function ensureImageForInstall(tag) {
   const canonical = `${IMAGE_REPO}:${tag}`
   const exists = await run('docker', ['image', 'inspect', canonical], { timeout: 15000 })
@@ -304,41 +334,11 @@ async function ensureImageForInstall(tag) {
     jobLog(`镜像已存在：${canonical}`)
     return
   }
-  const mirror = (await getAppSettings()).imageMirror
-  let code = 1
-  if (mirror === 'docker.fnnas.com') {
-    jobLog('使用飞牛官方镜像源（Docker 守护进程 registry-mirror）')
-    code = await spawnStream('docker', ['pull', canonical], process.env, (line) => {
-      jobLog(line)
-      pullPercent(line)
-    })
-    if (code !== 0) {
-      jobLog('飞牛官方镜像源拉取失败，回退到加速站')
-      const fallback = `docker.m.daocloud.io/${IMAGE_REPO}:${tag}`
-      code = await spawnStream('docker', ['pull', fallback], process.env, (line) => {
-        jobLog(line)
-        pullPercent(line)
-      })
-      if (code === 0) await run('docker', ['tag', fallback, canonical], { timeout: 30000 })
-    }
-  } else {
-    const mirrored = `${mirror}/${IMAGE_REPO}:${tag}`
-    jobLog(`拉取镜像：${mirrored}`)
-    code = await spawnStream('docker', ['pull', mirrored], process.env, (line) => {
-      jobLog(line)
-      pullPercent(line)
-    })
-    if (code === 0) {
-      await run('docker', ['tag', mirrored, canonical], { timeout: 30000 })
-    } else {
-      jobLog('加速站拉取失败，改走官方仓库')
-      code = await spawnStream('docker', ['pull', canonical], process.env, (line) => {
-        jobLog(line)
-        pullPercent(line)
-      })
-    }
-  }
-  if (code !== 0) throw new Error('镜像拉取失败：请检查网络或先在终端执行 tools/prepull.sh')
+  const pull = await pullImage(tag, {
+    onLine: (line) => { jobLog(line); pullPercent(line) }
+  })
+  if (!pull.ok) throw new Error('镜像拉取失败：请检查网络或先在终端执行 tools/prepull.sh')
+  jobLog(`镜像就绪（来源：${pull.source}）`)
   installJob.percent = 100
 }
 
@@ -1217,6 +1217,30 @@ async function nativeRunning() {
   return Boolean(pid)
 }
 
+async function pathHasData(dir) {
+  try {
+    return fs.existsSync(path.join(dir, 'config.yaml')) || fs.existsSync(path.join(dir, 'state.db'))
+  } catch { return false }
+}
+
+async function migrateDataDir(src, dst, label) {
+  if (!fs.existsSync(src) || !(await pathHasData(src))) return { migrated: false, reason: '源目录没有数据' }
+  if (await pathHasData(dst)) return { migrated: false, reason: '目标目录已有数据，保留现有数据' }
+  const image = `${IMAGE_REPO}:${await currentTag()}`
+  const uid = process.env.TRIM_UID || String(process.getuid?.() || 1000)
+  const gid = process.env.TRIM_GID || String(process.getgid?.() || 1000)
+  const r = await run('docker', [
+    'run', '--rm',
+    '-v', `${src}:/src:ro`,
+    '-v', `${dst}:/dst`,
+    '--entrypoint', 'sh',
+    image, '-lc', `mkdir -p /dst && cp -a /src/. /dst/ && chown -R ${uid}:${gid} /dst`
+  ], { timeout: 600000 })
+  if (r.code !== 0) throw new Error(`${label}数据迁移失败：${(r.stderr || '').slice(-300)}`)
+  logLine('INFO', `${label}数据已迁移：${src} → ${dst}`)
+  return { migrated: true }
+}
+
 async function ensureNativePerms() {
   const APP_GID = 901
   async function walk(dir) {
@@ -1262,6 +1286,7 @@ async function nativeStart() {
         try { await fsp.writeFile(NATIVE_PID_FILE, String(real), { mode: 0o600 }) } catch { /* 忽略 */ }
       }
       await ensureNativePerms()
+      await setRuntimeState({ stopped: false })
       setLastMessage('Hermes 原生运行时已启动')
       return { ok: true }
     }
@@ -1364,15 +1389,13 @@ async function nativeWriteConfig(body) {
 
 async function runNativeInstall(body) {
   const requested = cleanValue(body.imageTag || (body.version ? `${body.version}-desktop` : '') || IMAGE_TAG_DEFAULT)
-  const mirror = (await getAppSettings()).imageMirror
   const canonical = `${IMAGE_REPO}:${requested}`
   jobLog(`原生运行时目标：${canonical}`)
   const exists = await run('docker', ['image', 'inspect', canonical], { timeout: 30000 })
   if (exists.code !== 0) {
-    jobLog(`本地无镜像，拉取 ${mirror}/${IMAGE_REPO}:${requested}`)
-    const pull = await run('docker', ['pull', `${mirror}/${IMAGE_REPO}:${requested}`], { timeout: 1800000 })
-    if (pull.code !== 0) throw new Error(`拉取镜像失败：${pull.stderr.slice(-300)}`)
-    await run('docker', ['tag', `${mirror}/${IMAGE_REPO}:${requested}`, canonical], { timeout: 30000 })
+    const pull = await pullImage(requested, { onLine: jobLog })
+    if (!pull.ok) throw new Error(`拉取镜像失败：${pull.output || '请检查网络'}`)
+    jobLog(`镜像就绪（来源：${pull.source}）`)
   }
   installJob.percent = 20
   installJob.message = '提取原生运行时（Python/Webapp）'
@@ -1554,6 +1577,9 @@ async function dirSize(dir) {
 }
 
 async function readAppVersion() {
+  if (getRuntimeMode() === 'native' && runtimeCache?.version) {
+    return { full: `Hermes Agent ${runtimeCache.version}`, short: runtimeCache.version }
+  }
   const r = getRuntimeMode() === 'native'
     ? await run(nativeBin(), ['--version'], { timeout: 30000, env: nativeEnv() })
     : await hermesRun(['--version'], 15000)
@@ -1575,25 +1601,15 @@ async function withLock(fn) {
 }
 
 async function ensureImage() {
-  const canonical = `${IMAGE_REPO}:${await currentTag()}`
+  const tag = await currentTag()
+  const canonical = `${IMAGE_REPO}:${tag}`
   const local = await run('docker', ['image', 'inspect', canonical], { timeout: 15000 })
   if (local.code === 0) return { ok: true, pulled: false }
-  const mirror = (await getAppSettings()).imageMirror
-  const tag = await currentTag()
-  if (mirror === 'docker.fnnas.com') {
-    logLine('INFO', '本地无镜像，使用飞牛官方镜像源（registry-mirror）拉取')
-    const pull = await run('docker', ['pull', `${IMAGE_REPO}:${tag}`], { timeout: 1800000 })
-    return { ok: pull.code === 0, pulled: pull.code === 0 }
-  }
-  const mirrored = `${mirror}/${IMAGE_REPO}:${tag}`
-  logLine('INFO', `本地无镜像，尝试从 ${mirror} 拉取`)
-  const pull = await run('docker', ['pull', mirrored], { timeout: 1800000 })
-  if (pull.code === 0) {
-    await run('docker', ['tag', mirrored, canonical], { timeout: 30000 })
-    return { ok: true, pulled: true }
-  }
-  const official = await run('docker', ['pull', canonical], { timeout: 1800000 })
-  return { ok: official.code === 0, pulled: official.code === 0, error: official.stderr.slice(-400) }
+  logLine('INFO', '本地无镜像，开始拉取')
+  const pull = await pullImage(tag)
+  if (!pull.ok) throw new Error(`镜像拉取失败：${pull.output || '请检查网络'}`)
+  logLine('INFO', `镜像已就绪（来源：${pull.source}）`)
+  return { ok: true, pulled: true }
 }
 
 async function currentTag() {
@@ -1618,6 +1634,7 @@ function spawnHermes(args, options = {}) {
 async function doStart() {
   if (getRuntimeMode() === 'native') {
     setLastMessage('正在启动 Hermes 原生运行时…')
+    await setRuntimeState({ stopped: false })
     await nativeStart()
     return { ok: true }
   }
@@ -1632,6 +1649,7 @@ async function doStart() {
 
 async function doStop() {
   if (getRuntimeMode() === 'native') {
+    await setRuntimeState({ stopped: true })
     await nativeStop()
     return { ok: true }
   }
@@ -1685,21 +1703,9 @@ async function doUpgrade(body = {}) {
   const oldTag = await currentTag()
   const requested = cleanValue(body.tag || (body.version ? `${body.version}-desktop` : '') || oldTag)
   const tag = requested
-  const mirror = (await getAppSettings()).imageMirror
-  const canonical = `${IMAGE_REPO}:${tag}`
-
   logLine('INFO', `更新镜像：${oldTag} → ${tag}`)
-  let pull
-  if (mirror === 'docker.fnnas.com') {
-    pull = await run('docker', ['pull', canonical], { timeout: 1800000 })
-  } else {
-    const mirrored = `${mirror}/${IMAGE_REPO}:${tag}`
-    pull = await run('docker', ['pull', mirrored], { timeout: 1800000 })
-    if (pull.code === 0) await run('docker', ['tag', mirrored, canonical], { timeout: 30000 })
-  }
-  if (pull.code !== 0) {
-    throw new Error(`拉取镜像失败：${pull.stderr.slice(-400) || '网络不可用'}`)
-  }
+  const pull = await pullImage(tag)
+  if (!pull.ok) throw new Error(`拉取镜像失败：${pull.output || '网络不可用'}`)
 
   const composeEnv = await readEnv(COMPOSE_ENV)
   composeEnv.set('HERMES_DOCKER_IMAGE_TAG', tag)
@@ -2047,26 +2053,68 @@ async function startSnapshotRestore(id) {
 
 async function runSnapshotRestore(id) {
   const safetyId = `${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}`
+  const realData = await fsp.realpath(DATA_DIR).catch(() => DATA_DIR)
+  const parent = path.dirname(realData)
+  const base = path.basename(realData)
+  const stamp = `${Date.now()}`
+  const tempDir = path.join(parent, `.${base}.restore-${stamp}`)
+  const backupDir = path.join(parent, `.${base}.backup-${stamp}`)
+
+  try {
   setSnapJob({ percent: 6, message: '备份当前数据…' })
   await createSnapshot('恢复前自动备份', `restore ${id}`)
-  setSnapJob({ phase: 'stop', percent: 30, message: '停止容器…' })
+  setSnapJob({ phase: 'stop', percent: 30, message: '停止服务…' })
   await compose(['stop'], 120000)
-  setSnapJob({ phase: 'extract', percent: 45, message: '解包快照…' })
-  const entries = await fsp.readdir(DATA_DIR)
-  for (const name of entries) {
-    await fsp.rm(path.join(DATA_DIR, name), { recursive: true, force: true })
+  if (snapJob.state === 'cancelled') {
+    await compose(['up', '-d'], 600000).catch(() => {})
+    return
   }
-  const tar = await run('tar', ['-xzf', path.join(SNAPSHOT_DIR, `${id}.tar.gz`), '-C', DATA_DIR], { timeout: 600000 })
-  if (tar.code !== 0) throw new Error((tar.stderr || '解包失败').slice(-400))
-  setSnapJob({ phase: 'start', percent: 92, message: '启动容器…' })
+
+  setSnapJob({ phase: 'extract', percent: 45, message: '解包到临时目录…' })
+  await fsp.rm(tempDir, { recursive: true, force: true })
+  await fsp.mkdir(tempDir, { recursive: true })
+  const code = await new Promise((resolve, reject) => {
+    snapChild = spawn('tar', ['-xzf', path.join(SNAPSHOT_DIR, `${id}.tar.gz`), '-C', tempDir], { stdio: ['ignore', 'ignore', 'pipe'] })
+    let errText = ''
+    snapChild.stderr.on('data', (chunk) => { errText += chunk.toString() })
+    snapChild.on('close', (c) => {
+      snapChild = null
+      if (snapJob.state === 'cancelled') return resolve(-1)
+      c === 0 ? resolve(0) : reject(new Error(errText.slice(-400) || `tar 退出 ${c}`))
+    })
+    snapChild.on('error', (err) => { snapChild = null; reject(err) })
+  })
+  if (code === -1 || snapJob.state === 'cancelled') {
+    await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {})
+    await compose(['up', '-d'], 600000).catch(() => {})
+    return
+  }
+
+  setSnapJob({ phase: 'swap', percent: 85, message: '替换数据目录…' })
+  await fsp.rm(backupDir, { recursive: true, force: true }).catch(() => {})
+  await fsp.rename(realData, backupDir)
+  try {
+    await fsp.rename(tempDir, realData)
+  } catch (err) {
+    await fsp.rename(backupDir, realData).catch(() => {})
+    throw err
+  }
+  setSnapJob({ phase: 'start', percent: 94, message: '启动服务…' })
   await compose(['up', '-d'], 600000)
+  await fsp.rm(backupDir, { recursive: true, force: true }).catch(() => {})
   setSnapJob({ state: 'done', percent: 100, message: '恢复完成' })
   setLastMessage('快照已恢复')
   logLine('INFO', `已恢复快照 ${id}（安全快照 ${safetyId}）`)
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {})
+  }
 }
 
 function cancelSnapshotJob() {
   if (snapJob.state !== 'running') return { ok: true }
+  if (snapJob.kind === 'restore' && ['swap', 'start'].includes(snapJob.phase)) {
+    return { ok: false, error: '恢复已进入替换阶段，无法取消' }
+  }
   setSnapJob({ state: 'cancelled', message: '正在取消…' })
   if (snapTimer) { clearInterval(snapTimer); snapTimer = null }
   if (snapChild) {
@@ -2390,19 +2438,63 @@ async function handleApi(req, res, pathname, url) {
       const body = await readBody(req)
       const mode = cleanValue(body.mode)
       if (!['docker', 'native'].includes(mode)) throw badRequest('未知运行时')
+      if (mode === getRuntimeMode()) return json(res, 200, { ok: true, mode, changed: false })
       if (mode === 'native' && !fs.existsSync(nativeBin())) throw badRequest('原生运行时尚未安装')
-      if (mode === 'native') {
-        // 同端口若被 Docker 容器占用，先停容器再启动原生进程
-        await run('docker', ['stop', CONTAINER_NAME], { timeout: 120000 }).catch(() => {})
-        const tag = await currentTag()
-        await setRuntimeState({ mode: 'native', tag: runtimeCache?.tag || tag, version: (runtimeCache?.version || tag.replace(/-desktop$/, '')) })
-        await nativeStart()
-      } else {
-        await nativeStop().catch(() => {})
-        await setRuntimeState({ mode: 'docker' })
-        await compose(['up', '-d', '--remove-orphans'], 600000)
-      }
-      return json(res, 200, { ok: true, mode })
+
+      const result = await withLock(async () => {
+        let migrated = false
+        let warning = ''
+        if (mode === 'native') {
+          if (await pathHasData(DATA_DIR_DEFAULT)) {
+            try {
+              await createSnapshot('切换运行时时自动备份', 'before native switch')
+            } catch (err) {
+              warning = `自动备份失败：${err.message}`
+              logLine('WARN', warning)
+            }
+          }
+          await run('docker', ['stop', CONTAINER_NAME], { timeout: 120000 }).catch(() => {})
+          try {
+            const move = await migrateDataDir(DATA_DIR_DEFAULT, NATIVE_DATA_DIR, '切换原生')
+            migrated = move.migrated
+            if (!move.migrated && move.reason) warning = [warning, move.reason].filter(Boolean).join('；')
+          } catch (err) {
+            await compose(['up', '-d', '--remove-orphans'], 600000).catch(() => {})
+            throw err
+          }
+          const tag = await currentTag()
+          await setRuntimeState({
+            mode: 'native',
+            tag: runtimeCache?.tag || tag,
+            version: runtimeCache?.version || tag.replace(/-desktop$/, ''),
+            stopped: false
+          })
+          await nativeStart()
+        } else {
+          if (await pathHasData(NATIVE_DATA_DIR)) {
+            try {
+              await createSnapshot('切换运行时时自动备份', 'before docker switch')
+            } catch (err) {
+              warning = `自动备份失败：${err.message}`
+              logLine('WARN', warning)
+            }
+          }
+          await nativeStop().catch(() => {})
+          try {
+            const move = await migrateDataDir(NATIVE_DATA_DIR, DATA_DIR_DEFAULT, '切换 Docker')
+            migrated = move.migrated
+            if (!move.migrated && move.reason) warning = [warning, move.reason].filter(Boolean).join('；')
+          } catch (err) {
+            await nativeStart().catch(() => {})
+            throw err
+          }
+          await setRuntimeState({ mode: 'docker', stopped: false })
+          const up = await compose(['up', '-d', '--remove-orphans'], 600000)
+          if (up.code !== 0) throw new Error((up.stderr || 'Docker 启动失败').slice(-400))
+        }
+        return { migrated, warning }
+      })
+      return json(res, 200, { ok: true, mode, changed: true, ...result })
     } catch (err) {
       return json(res, err.statusCode || 500, { error: err.message })
     }
@@ -2724,7 +2816,9 @@ async function handleApi(req, res, pathname, url) {
   }
 
   if (method === 'POST' && pathname === '/api/snapshots/cancel') {
-    return json(res, 200, cancelSnapshotJob())
+    const result = cancelSnapshotJob()
+    if (result.ok === false) return json(res, 409, { error: result.error })
+    return json(res, 200, result)
   }
 
   if (method === 'POST' && pathname === '/api/snapshots/restore') {
@@ -3029,8 +3123,29 @@ const server = http.createServer(async (req, res) => {
 
 WEBAPP_PORT = readWebappPort()
 if (getRuntimeMode() === 'native' && isInstalled()) {
-  nativeStart().catch((err) => logLine('ERROR', `原生运行时启动失败：${err.message}`))
+  if (runtimeCache?.stopped !== true) {
+    nativeStart().catch((err) => logLine('ERROR', `原生运行时启动失败：${err.message}`))
+  }
 }
+
+let nativeHealing = false
+setInterval(async () => {
+  if (getRuntimeMode() !== 'native' || !isInstalled()) return
+  if (runtimeCache?.stopped === true) return
+  if (actionLock || snapJob.state === 'running' || installJob.state === 'running') return
+  if (nativeHealing) return
+  nativeHealing = true
+  try {
+    if (!(await nativeRunning())) {
+      logLine('WARN', '原生运行时不在线，尝试自动拉起')
+      await nativeStart()
+    }
+  } catch (err) {
+    logLine('ERROR', `原生运行时自愈失败：${err.message}`)
+  } finally {
+    nativeHealing = false
+  }
+}, 30000)
 
 function listen() {
   if (PORT) {

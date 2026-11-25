@@ -20,6 +20,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci --prefix frontend
 
+      - name: Syntax and config checks
+        run: ./scripts/check.sh
+
       - name: Build manager frontend
         run: npm run build --prefix frontend
 
