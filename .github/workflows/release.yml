@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -41,11 +43,14 @@ jobs:
       - name: Checksums
         run: sha256sum hermes-agent.fpk > hermes-agent.fpk.sha256
 
+      - name: Release notes
+        run: python3 scripts/release_notes.py > release-body.md
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             hermes-agent.fpk
             hermes-agent.fpk.sha256
-          generate_release_notes: true
+          body_path: release-body.md
           fail_on_unmatched_files: true
