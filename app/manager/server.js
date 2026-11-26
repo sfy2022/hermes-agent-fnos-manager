@@ -1158,7 +1158,7 @@ async function setRuntimeState(next) {
 }
 
 function nativeBin() {
-  return path.join(NATIVE_HOME, '.venv/bin/hermes')
+  return runtimeCache?.bin || path.join(NATIVE_HOME, '.venv/bin/hermes')
 }
 
 function nativeEnv() {
@@ -1166,7 +1166,7 @@ function nativeEnv() {
     ...process.env,
     HOME: DATA_DIR,
     HERMES_HOME: DATA_DIR,
-    HERMES_WEBAPP_DIST: path.join(NATIVE_HOME, 'apps/desktop/dist-webapp'),
+    HERMES_WEBAPP_DIST: runtimeCache?.webappDist || path.join(NATIVE_HOME, 'apps/desktop/dist-webapp'),
     HERMES_DASHBOARD: '1',
     PATH: `${path.join(NATIVE_HOME, '.venv/bin')}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${process.env.PATH ? `:${process.env.PATH}` : ''}`
   }
@@ -1394,7 +1394,92 @@ async function nativeWriteConfig(body) {
   return { username, port }
 }
 
+async function downloadNativeInstaller() {
+  const script = path.join(NATIVE_DIR, 'install.sh')
+  const urls = [
+    'https://hermes-agent.nousresearch.com/install.sh',
+    'https://raw.githubusercontent.com/NousResearch/hermes-agent/main/install.sh'
+  ]
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(60000) })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const text = await res.text()
+      if (!text.includes('HERMES') || text.length < 1000) throw new Error('内容不完整')
+      await fsp.mkdir(NATIVE_DIR, { recursive: true })
+      await fsp.writeFile(script, text, { mode: 0o755 })
+      return script
+    } catch (err) {
+      jobLog(`下载安装脚本失败（${url}）：${err.message}`)
+    }
+  }
+  throw new Error('无法下载 Hermes 安装脚本，请检查网络')
+}
+
+async function runNativeSourceInstall(body) {
+  const requested = cleanValue(body.version || (body.imageTag || '').replace(/-desktop$/, '') || '')
+  const version = requested || ''
+  const script = await downloadNativeInstaller()
+  const sourceDir = path.join(NATIVE_DIR, 'source')
+  await fsp.rm(sourceDir, { recursive: true, force: true })
+  await fsp.mkdir(NATIVE_DATA_DIR, { recursive: true })
+
+  installJob.percent = 10
+  installJob.message = '下载源码与依赖（国内镜像加速）'
+  jobLog('使用国内镜像：PyPI 清华源 / npmmirror / Electron 镜像')
+  jobLog(`源码目录：${sourceDir}`)
+
+  const env = {
+    ...process.env,
+    HOME: NATIVE_DATA_DIR,
+    HERMES_HOME: NATIVE_DATA_DIR,
+    HERMES_REPO_URL: process.env.HERMES_REPO_URL || 'https://github.com/NousResearch/hermes-agent.git',
+    PIP_INDEX_URL: process.env.PIP_INDEX_URL || 'https://pypi.tuna.tsinghua.edu.cn/simple',
+    UV_INDEX_URL: process.env.UV_INDEX_URL || 'https://pypi.tuna.tsinghua.edu.cn/simple',
+    UV_DEFAULT_INDEX: process.env.UV_DEFAULT_INDEX || 'https://pypi.tuna.tsinghua.edu.cn/simple',
+    npm_config_registry: process.env.npm_config_registry || 'https://registry.npmmirror.com',
+    NPM_CONFIG_REGISTRY: process.env.NPM_CONFIG_REGISTRY || 'https://registry.npmmirror.com',
+    ELECTRON_MIRROR: process.env.ELECTRON_MIRROR || 'https://npmmirror.com/mirrors/electron/',
+    ELECTRON_SKIP_BINARY_DOWNLOAD: '1',
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1',
+    NODE_MIRROR: process.env.NODE_MIRROR || 'https://npmmirror.com/mirrors/node',
+    npm_config_disturl: process.env.npm_config_disturl || 'https://npmmirror.com/mirrors/node',
+    PATH: `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ''}`
+  }
+  const args = [script, '--non-interactive', '--include-desktop', '--skip-browser', '--dir', sourceDir, '--hermes-home', NATIVE_DATA_DIR]
+  if (/^v?\d+\.\d+\.\d+$/.test(version)) args.push('--branch', version.startsWith('v') ? version : `v${version}`)
+
+  installJob.percent = 25
+  installJob.message = '源码构建中（首次可能 10–30 分钟）'
+  const code = await spawnStream('/bin/bash', args, env, (line) => jobLog(line))
+  if (code !== 0) throw new Error('源码构建失败，请查看安装日志')
+
+  const bin = path.join(sourceDir, '.hermes/bin/hermes')
+  const webappDist = path.join(sourceDir, 'apps/desktop/dist-webapp')
+  if (!fs.existsSync(bin)) throw new Error('源码安装完成但未找到 hermes 命令')
+  if (!fs.existsSync(webappDist)) throw new Error('源码安装完成但未找到 Desktop Webapp 产物')
+
+  installJob.percent = 85
+  installJob.message = '写入配置并启动原生运行时'
+  await setRuntimeState({
+    mode: 'native',
+    source: 'source',
+    bin,
+    webappDist,
+    tag: version ? `${version.replace(/-desktop$/, '')}-desktop` : '',
+    version: version.replace(/-desktop$/, ''),
+    stopped: false
+  })
+  await nativeWriteConfig(body)
+  await nativeStop().catch(() => {})
+  await nativeStart()
+  installJob.percent = 100
+  installJob.message = '原生源码运行时已就绪'
+  jobLog('源码运行时已启动')
+}
+
 async function runNativeInstall(body) {
+  if (body.nativeSource === 'source') return runNativeSourceInstall(body)
   const requested = cleanValue(body.imageTag || (body.version ? `${body.version}-desktop` : '') || IMAGE_TAG_DEFAULT)
   const canonical = `${IMAGE_REPO}:${requested}`
   jobLog(`原生运行时目标：${canonical}`)
@@ -1427,7 +1512,15 @@ async function runNativeInstall(body) {
     canonical, '-R', `${uid}:${gid}`, '/target', '/data', '/workspace'], { timeout: 300000 })
   installJob.percent = 55
   installJob.message = '修复解释器与配置'
-  await setRuntimeState({ mode: 'native', tag: requested, version: requested.replace(/-desktop$/, '') })
+  await setRuntimeState({
+    mode: 'native',
+    source: 'image',
+    bin: path.join(NATIVE_HOME, '.venv/bin/hermes'),
+    webappDist: path.join(NATIVE_HOME, 'apps/desktop/dist-webapp'),
+    tag: requested,
+    version: requested.replace(/-desktop$/, ''),
+    stopped: false
+  })
   await fixNativeInterpreter()
   jobLog('解释器链接已修复')
   await nativeWriteConfig(body)
@@ -2439,7 +2532,8 @@ async function handleApi(req, res, pathname, url) {
         installed: fs.existsSync(nativeBin()),
         running: await nativeRunning(),
         tag: runtimeCache?.tag || '',
-        version: runtimeCache?.version || ''
+        version: runtimeCache?.version || '',
+        source: runtimeCache?.source || ''
       }
     })
   }

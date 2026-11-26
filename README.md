@@ -29,7 +29,10 @@
 安装 Hermes 时可选两种运行时：
 
 - **Docker 容器（默认）**：官方镜像、隔离性好；
-- **原生运行时（实验）**：从官方镜像提取 Python 与 Webapp 到应用私有目录，由管理端直接托管 `hermes gateway run`，不启动容器；隔离性弱，首次仍需本地存在对应镜像。
+- **原生运行时（实验）**：
+  - **源码构建（国内加速）**：官方 `install.sh` 拉源码，本地构建 Python 与 Webapp；PyPI 走清华源、npm 走 npmmirror、Electron 走国内镜像，`HERMES_REPO_URL` 可覆盖 GitHub 源；首次约 10–30 分钟；
+  - **镜像提取（快速）**：从官方镜像提取 Python 与 Webapp，需要本地已有镜像；
+  - 两者都由管理端直接托管 `hermes gateway run`，不启动容器，隔离性弱于 Docker。
 
 ## 首次使用
 

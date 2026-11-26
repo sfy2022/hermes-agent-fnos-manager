@@ -11,8 +11,9 @@
     <div v-if="!started" class="space-y-4">
       <n-alert type="info" :bordered="false" class="!text-[13px]">
         <template v-if="form.runtime === 'native'">
-          原生运行时（实验）：从官方镜像提取 Python 与 Webapp，不启动容器，由管理端直接托管进程。
-          首次仍需本地存在对应镜像；优势是无 Docker 运行时，代价是隔离性较弱。
+          原生运行时（实验）：由管理端直接托管 Hermes 进程，不启动容器。
+          源码构建会从 GitHub 拉源码并用国内镜像（PyPI 清华源、npmmirror、Electron 镜像）安装依赖，首次约 10–30 分钟；
+          镜像提取则复用官方镜像里的 Python/Webapp，速度更快但需要本地有镜像。
         </template>
         <template v-else>
           安装会拉取官方镜像、生成访问口令与配置并启动容器。首次下载约 3.76 GB，耗时取决于网络；
@@ -25,6 +26,14 @@
         <n-radio-group v-model:value="form.runtime" class="w-full flex">
           <n-radio-button value="docker" class="!flex-1 text-center">Docker 容器（默认）</n-radio-button>
           <n-radio-button value="native" class="!flex-1 text-center">原生运行时（实验）</n-radio-button>
+        </n-radio-group>
+      </div>
+
+      <div v-if="form.runtime === 'native'">
+        <div class="text-[12px] text-slate-500 dark:text-slate-400 mb-1">原生安装方式</div>
+        <n-radio-group v-model:value="form.nativeSource" class="w-full flex">
+          <n-radio-button value="source" class="!flex-1 text-center">源码构建（国内加速）</n-radio-button>
+          <n-radio-button value="image" class="!flex-1 text-center">镜像提取（快速）</n-radio-button>
         </n-radio-group>
       </div>
 
@@ -158,6 +167,7 @@ const visible = computed({
 
 const form = reactive({
   runtime: 'docker',
+  nativeSource: 'source',
   username: 'admin',
   password: '',
   version: '',
