@@ -1,5 +1,5 @@
 appname               = hermes-agent
-version               = 0.30.0
+version               = 0.30.1
 display_name          = Hermes Agent
 desc                  = Hermes Agent 管理应用：先装管理器，再在管理器里手动安装 Hermes Agent。<br/>• 桌面入口「Hermes Admin」→ 管理端；工作台通过应用中心第二入口或管理端打开<br/>• 安装向导可选存储位置、运行权限（Root/Package）与运行时（Docker/原生）<br/>• 会话、记忆、技能持久保存，卸载保留、可直接备份
 platform              = x86
@@ -16,4 +16,4 @@ micro_app             = true
 service_port          = 9121
 checkport             = false
 ctl_stop              = true
-changelog             = 0.30.0 原生运行时支持源码构建：官方 install.sh + PyPI/npm/Electron 国内镜像，源码构建与镜像提取二选一
+changelog             = 0.30.1 修复「数据目录」存储模式安装失败：cmd/main 不再硬编码共享目录，管理端按向导选择解析数据路径，并改进缺失配置的错误信息

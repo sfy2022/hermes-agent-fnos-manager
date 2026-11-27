@@ -56,8 +56,6 @@ start_manager() {
     (
         cd "${DEST_DIR}/manager" || exit 1
         HERMES_APP_DIR="${APP_DIR}" \
-        HERMES_DATA_DIR="${APP_DIR}/shares/hermes-agent/data" \
-        HERMES_WORKSPACE_DIR="${APP_DIR}/shares/hermes-agent/workspace" \
         HERMES_COMPOSE_FILE="${COMPOSE_FILE}" \
         setsid nohup "${node}" "${SERVER_JS}" >>"${OUT_LOG}" 2>&1 < /dev/null &
         echo $! >"${PID_FILE}"

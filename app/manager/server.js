@@ -48,10 +48,10 @@ const SHARE_DATA_DIR = path.join(APP_DIR, 'shares/hermes-agent/data')
 const SHARE_WORKSPACE_DIR = path.join(APP_DIR, 'shares/hermes-agent/workspace')
 const NATIVE_DATA_DIR = path.join(VAR_DIR, 'native/data')
 const NATIVE_WORKSPACE_DIR = path.join(VAR_DIR, 'native/workspace')
-const DATA_DIR_DEFAULT = process.env.HERMES_DATA_DIR || (dataLibraryType === 'data'
+let DATA_DIR_DEFAULT = process.env.HERMES_DATA_DIR || (dataLibraryType === 'data'
   ? path.join(VAR_DIR, 'data-root')
   : SHARE_DATA_DIR)
-const WORKSPACE_DIR_DEFAULT = process.env.HERMES_WORKSPACE_DIR || (dataLibraryType === 'data'
+let WORKSPACE_DIR_DEFAULT = process.env.HERMES_WORKSPACE_DIR || (dataLibraryType === 'data'
   ? path.join(VAR_DIR, 'workspace-root')
   : SHARE_WORKSPACE_DIR)
 const bootRuntime = (() => {
@@ -59,6 +59,19 @@ const bootRuntime = (() => {
 })()
 let DATA_DIR = bootRuntime.mode === 'native' ? NATIVE_DATA_DIR : DATA_DIR_DEFAULT
 let WORKSPACE_DIR = bootRuntime.mode === 'native' ? NATIVE_WORKSPACE_DIR : WORKSPACE_DIR_DEFAULT
+
+// 安装向导可能在本进程启动后才落盘；每次安装前重新读取一次选择，避免沿用旧路径。
+function refreshInstallPaths() {
+  if (getRuntimeMode() === 'native') return
+  const fresh = readInstallChoices()
+  const type = fresh.data_library_type || dataLibraryType
+  DATA_DIR_DEFAULT = process.env.HERMES_DATA_DIR || (type === 'data' ? path.join(VAR_DIR, 'data-root') : SHARE_DATA_DIR)
+  WORKSPACE_DIR_DEFAULT = process.env.HERMES_WORKSPACE_DIR || (type === 'data' ? path.join(VAR_DIR, 'workspace-root') : SHARE_WORKSPACE_DIR)
+  if (!process.env.HERMES_DATA_DIR) {
+    DATA_DIR = DATA_DIR_DEFAULT
+    WORKSPACE_DIR = WORKSPACE_DIR_DEFAULT
+  }
+}
 
 const COMPOSE_FILE = process.env.HERMES_COMPOSE_FILE || path.join(DEST_DIR, 'docker/docker-compose.yaml')
 const COMPOSE_ENV = path.join(DEST_DIR, 'docker/.env')
@@ -355,6 +368,7 @@ async function waitWebapp(port, timeoutMs) {
 }
 
 function installerEnv(body) {
+  const fresh = readInstallChoices()
   const user = process.env.TRIM_USERNAME || os.userInfo().username || 'docker-hermes-agent'
   const group = process.env.TRIM_GROUPNAME || user
   return {
@@ -366,8 +380,8 @@ function installerEnv(body) {
     TRIM_GROUPNAME: group,
     HERMES_MANAGER_INSTALL: '1',
     HERMES_IMAGE_TAG: body.imageTag,
-    wizard_data_library_type: dataLibraryType,
-    wizard_dsh_run_user: runUserChoice,
+    wizard_data_library_type: fresh.data_library_type || dataLibraryType,
+    wizard_dsh_run_user: fresh.run_user || runUserChoice,
     wizard_dashboard_username: body.username,
     wizard_dashboard_password: body.password,
     wizard_provider: body.provider,
@@ -398,6 +412,7 @@ function validateInstall(body) {
 }
 
 async function runInstall(body) {
+  refreshInstallPaths()
   try {
     jobStep('pull', body.imageTag === IMAGE_TAG_DEFAULT ? '准备镜像（首次约 3.76 GB）' : '准备镜像')
     await ensureImageForInstall(body.imageTag)
@@ -412,7 +427,7 @@ async function runInstall(body) {
     })
     if (code !== 0 || failed) throw new Error('配置生成失败，请查看安装日志')
     if (!fs.existsSync(CONFIG_ENV) || !fs.existsSync(path.join(DATA_DIR, 'config.yaml'))) {
-      throw new Error('配置生成不完整（运行配置或 config.yaml 缺失），请检查数据目录权限')
+      throw new Error(`配置生成不完整：未找到 ${CONFIG_ENV} 或 ${path.join(DATA_DIR, 'config.yaml')}`)
     }
 
     jobStep('start', '启动 Hermes 容器')

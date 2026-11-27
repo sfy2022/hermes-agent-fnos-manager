@@ -100,7 +100,7 @@ const Snapshots = defineAsyncComponent(() => import('./views/Snapshots.vue'))
 const Logs = defineAsyncComponent(() => import('./views/Logs.vue'))
 const SettingsView = defineAsyncComponent(() => import('./views/Settings.vue'))
 
-const appVersion = '0.30.0'
+const appVersion = '0.30.1'
 
 const TABS = {
   overview: { title: '概览', icon: Dashboard, view: Overview, label: '概览' },
